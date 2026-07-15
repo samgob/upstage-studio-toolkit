@@ -580,8 +580,28 @@ def v2_upload_file(file_path: Path, api_key: str,
         )
 
         if isinstance(result, dict) and result.get("id"):
-            logger.debug(f"Uploaded {filename} -> {result['id']}")
-            return result["id"]
+            file_id = result["id"]
+            logger.debug(f"Uploaded {filename} -> {file_id}")
+            # Wait until page-image conversion finishes before returning. Creating
+            # a job against a file that's still PROCESSING returns 409 (non-
+            # retryable here), so a large/slow-converting doc would otherwise fail
+            # its first pass and only recover on the auto-retry or --resume.
+            for _ in range(60):  # ~2 min ceiling at 2s intervals
+                if is_shutdown_requested():
+                    break
+                info = api_request(
+                    "GET", f"{V2_BASE}/files/{file_id}?view=status",
+                    api_key, timeout=30, logger=logger,
+                )
+                status = (str(info.get("status", "")).upper()
+                          if isinstance(info, dict) else "")
+                if status in ("UPLOADED", "READY"):
+                    break
+                if status == "FAILED":
+                    logger.error(f"File conversion failed for {filename}")
+                    return None
+                time.sleep(2)
+            return file_id
 
         err = result.get("error", "Unknown upload error")
         logger.error(f"Upload failed for {filename}: {err}")
