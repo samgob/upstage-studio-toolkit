@@ -1,0 +1,74 @@
+{
+  "type": "json_schema",
+  "name": "submission_fields",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "applicant_name": {
+        "type": "string",
+        "description": "Legal name of the applicant business, exactly as written on the form."
+      },
+      "mailing_address": {
+        "type": "string",
+        "description": "Full mailing address of the applicant, on one line."
+      },
+      "business_phone": {
+        "type": "string",
+        "description": "Primary business phone number."
+      },
+      "nature_of_business": {
+        "type": "string",
+        "description": "The type of business, taken only from an explicit business-type description (e.g. 'general contractor')."
+      },
+      "years_in_business": {
+        "type": "integer",
+        "description": "Number of years the business has operated, only if given as a count of years. If a four-digit start year is written instead, leave this blank and use business_start_date."
+      },
+      "business_start_date": {
+        "type": "string",
+        "description": "The year the business started, if given as a four-digit year instead of a count of years."
+      },
+      "total_receipts": {
+        "type": "number",
+        "description": "Annual gross sales / total receipts in dollars. Digits only, no currency symbols or commas. This is revenue, not payroll."
+      },
+      "lines_of_business_requested": {
+        "type": "array",
+        "description": "Each coverage line requested on the application.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "line_of_business": {
+              "type": "string",
+              "description": "Name of a single requested coverage line."
+            }
+          }
+        }
+      },
+      "prior_carriers": {
+        "type": "array",
+        "description": "Prior insurance carriers listed on the application.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "carrier": { "type": "string", "description": "Carrier name." },
+            "policy_year": { "type": "string", "description": "Policy year or term." }
+          }
+        }
+      },
+      "loss_history": {
+        "type": "array",
+        "description": "Prior losses / claims listed on the application.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "carrier": { "type": "string", "description": "Carrier that handled the claim." },
+            "date_of_loss": { "type": "string", "description": "Date the loss occurred." },
+            "claim_amount": { "type": "number", "description": "Total claim amount in dollars, digits only." }
+          }
+        }
+      }
+    },
+    "required": ["applicant_name"]
+  }
+}

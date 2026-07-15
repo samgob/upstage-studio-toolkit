@@ -1,0 +1,25 @@
+{
+  "ground_truth_dir": "gt/",
+  "extractions_dir": "results/",
+  "normalization_rules_file": "examples/normalization_rules.example.json",
+  "fields": [
+    "applicant_name",
+    "mailing_address",
+    "business_phone",
+    "nature_of_business",
+    "years_in_business",
+    "business_start_date",
+    "total_receipts",
+    "lines_of_business_requested",
+    "prior_carriers",
+    "loss_history"
+  ],
+  "field_config": {
+    "lines_of_business_requested": { "type": "array" },
+    "prior_carriers": { "type": "array", "match": "key", "key": "carrier" },
+    "loss_history": { "type": "array", "match": "key", "key": "carrier" }
+  },
+  "tn_policy": "exclude",
+  "accuracy_threshold": 0.9,
+  "output_report": "accuracy_report.md"
+}

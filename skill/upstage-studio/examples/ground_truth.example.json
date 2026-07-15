@@ -1,0 +1,23 @@
+{
+  "doc": "01_triangle.pdf",
+  "ground_truth": {
+    "applicant_name": "Triangle Contracting LLC",
+    "mailing_address": "412 Industrial Way, Raleigh, NC 27601",
+    "business_phone": "919-555-0142",
+    "nature_of_business": "General contractor",
+    "years_in_business": 22,
+    "business_start_date": "",
+    "total_receipts": 4200000,
+    "lines_of_business_requested": [
+      { "line_of_business": "Commercial General Liability" },
+      { "line_of_business": "Commercial Property" }
+    ],
+    "prior_carriers": [
+      { "carrier": "Acme Mutual", "policy_year": "2023" }
+    ],
+    "loss_history": [
+      { "carrier": "Acme Mutual", "date_of_loss": "2022-06-14", "claim_amount": 12000 },
+      { "carrier": "Beacon Insurance", "date_of_loss": "2021-03-02", "claim_amount": 0 }
+    ]
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "rules": [
+    { "scope": "*", "operations": ["strip", "collapse_whitespace"] },
+    { "scope": "total_receipts", "operations": ["remove_currency"] },
+    { "scope": "claim_amount", "operations": ["remove_currency"] },
+    { "scope": "business_phone", "operations": ["digits_only"] }
+  ]
+}
