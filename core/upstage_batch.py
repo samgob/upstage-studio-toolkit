@@ -1496,7 +1496,8 @@ def generate_html_report(results: List[Dict], summary: Dict,
 <meta charset="UTF-8">
 <title>Upstage Batch Report</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+/* System font stack only — the report opens fully offline and never fetches
+   third-party assets (matches the toolkit's no-phone-home posture). */
 
 :root {{
   --bg-dark: #191722;
