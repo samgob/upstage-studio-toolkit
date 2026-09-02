@@ -124,6 +124,29 @@ newest jobs.
 
 ---
 
+## Configs and the default — `GET /v2/agents/{agent_id}/configs`
+
+Every edit to a workflow creates a new immutable config version, so "updating"
+a step means creating a new config (clone the current one, swap in the new
+schema) and, when you're happy with it, marking it the Agent's default with
+`is_default: true` — which un-sets whichever config held it before.
+
+Two things follow from that, and they bite during a testing push:
+
+- **Name experiments, and clean them up.** Iterating on a schema produces
+  configs fast. A prefix (`test_`, `diag_`) keeps them identifiable, and
+  deleting them once the decision is made keeps the list readable — thirty
+  same-named configs is a list nobody can pick the champion out of.
+- **Confirm the default after any batch of creates.** `GET` the config list and
+  check that the config carrying `is_default: true` is the one you intend, and
+  do it before anyone runs the Agent from the Studio UI. API jobs run whatever
+  `config_id` you pin, so they're unaffected — but a UI run takes the default,
+  and that's how a UI run and an API run end up disagreeing about a workflow
+  that "hasn't changed". Treat the default as something you set explicitly and
+  verify, not something you infer.
+
+---
+
 ## Error codes
 
 A `failed` job carries `error.code` and `error.message`:
@@ -149,3 +172,8 @@ automatically, honoring `Retry-After`).
 Identical file + identical step settings reuse prior results for **7 days**.
 `metadata.cached` is `"true"` when every step was served from cache. To force a
 fresh run, change any step setting (or the schema) so the inputs differ.
+
+This matters when you re-run a config to measure run-to-run variation: two runs
+that return byte-identical output are one draw served twice, not two draws.
+Change something about the input before you re-run, and treat `metadata.cached`
+as a hint rather than proof — the output itself is the evidence.

@@ -50,6 +50,21 @@ build.sh                       ← assembles dist/upstage-studio.zip + dist/upst
   environment rather than the command line.
 - API keys are read from `UPSTAGE_API_KEY` (or `--key`), never hard-coded.
 
+## Changes 2026-09
+
+- `score.py` gains `--extractions-dir` and `--run-label`, so you can score
+  several runs of one config without cloning the config file, and every report
+  now opens with a `SCOPE:` line (documents, cells, TN policy, run label).
+- `tn_policy` is now required in the scoring config — the scorer names the two
+  choices instead of silently defaulting one. Scoring math is unchanged.
+- New guidance on measuring honestly: run each config n ≥ 3 times and report the
+  spread, score on the model you'll actually deploy, and get the answer key
+  before writing ground truth (`references/scoring-guide.md`).
+- Schema guide adds the hard schema-size limit and how to measure it, the
+  generic-examples rule, the `json_schema` vs `response_format` envelope, and
+  when to stop editing field descriptions; parse and config-hygiene notes added
+  to `SKILL.md` / `references/agent-api.md`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
