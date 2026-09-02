@@ -57,10 +57,37 @@ It lives inside the step's `text.format`:
 - Top-level fields may be `string`, `number`, `integer`, `boolean`, or `array`.
   To group repeating rows (a loss-history table, a list of coverages), use an
   **array of objects**, as shown above.
-- Nesting goes up to three levels: root → array → object → primitive.
+- Nesting goes up to three levels: root → array → object → primitive. There is
+  no fourth level — a nested object inside a row object won't validate, so
+  flatten it into columns on the row.
 - Field names shouldn't start with `_`.
-- `mode` on the step selects the model tier: `standard`, `auto`, or `enhanced`
+- `mode` on the step selects the model tier: `standard` or `enhanced`
   (vision-enhanced; enhanced supports up to 50 pages, standard up to 1,000).
+- **The envelope matters.** The extraction step takes the `json_schema` object
+  shown above — `{"type": "json_schema", "name": ..., "schema": {...}}` — on
+  its own. Only the **classify** step wraps its schema in a `response_format`
+  object. Wrapping an extraction schema in `response_format` (or unwrapping a
+  classify one) is a common copy-paste error and reads as an invalid schema.
+
+**Size limit: the schema string is hard-capped.** Creating a config is rejected
+outright if the extraction step's schema serializes to more than 15,000
+characters — a flat request rejection at config-creation time, not a quality
+warning, and you find it when a rewrite you liked won't save.
+
+- **Measure it the way the API does:** `len(json.dumps(schema))` with Python's
+  **default separators**. A compact/minified measurement
+  (`separators=(",", ":")`) understates it by a few hundred characters, which is
+  enough to read "safe" on a schema that gets rejected.
+- **Budget ≤ 12,000** on that measurement. That leaves room to add an instruct
+  step or a few more descriptions later without a compression pass over
+  everything you already tuned. Treat the budget as a design input before you
+  start writing descriptions, not a ceiling you discover.
+
+**Keep examples in descriptions generic.** One or two examples in a field
+description help; a string lifted verbatim from a document you are going to
+score does not — it turns the schema into its own answer key, and the field
+looks solved on that document and nowhere else. Write the shape
+("`YYYY-MM-DD`", "a dollar figure, digits only"), not the answer.
 
 **Descriptions do the heavy lifting.** The field name tells the model *what to
 call* the value; the description tells it *what the value is and how to handle
@@ -72,6 +99,18 @@ it*. Precise descriptions produce clean, consistent output. For example:
 - Point at the right source: "Total receipts — the annual gross sales figure,
   not payroll."
 - Constrain the format: "Digits only, no currency symbols or commas."
+
+**When to stop editing descriptions.** Description edits have a floor. If you
+have made about three scored changes to the same field and none of them moved
+the number by more than the run-to-run spread you measured (see
+`scoring-guide.md` — "Run it more than once"), a fourth wording is not a fourth
+experiment. Close that field to prose edits and change a different variable:
+**input framing** — split a multi-document packet so the field is extracted from
+one document instead of a pile; **a ruling** — take the scope question to
+whoever owns the process and write the answer into ground truth; or **parse
+quality** — check what the model is actually reading before blaming what it was
+asked. A field that has plateaued is a finding worth recording, not a failure to
+keep grinding at.
 
 **Start with required fields.** List the fields your downstream system must have
 as `required`, get those accurate first, then add optional fields as a bonus.

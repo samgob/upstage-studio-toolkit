@@ -56,6 +56,8 @@ An Agent job is three API calls. `scripts/run_agent.py` does all three for you; 
 
 **Version pinning.** Pass `config_id` (or its version number) on every job so you always run the exact workflow version you validated. Omit it and the Agent runs its current default.
 
+**Config hygiene.** Testing variations creates configs quickly. Give experiments a name prefix (`test_`, `diag_`) so they're identifiable, delete them once the decision is made, and — after any batch of config creates — confirm which config actually carries `is_default` before anyone runs the Agent from the Studio UI. API jobs pin their version; UI runs take the default, so the two can quietly diverge. See `references/agent-api.md`.
+
 See `references/agent-api.md` for the full endpoint reference (auth, file input methods, job listing, pagination, error codes, and caching).
 
 ## Editing the schema, classes, and instruct prompt
@@ -83,9 +85,20 @@ Ground truth is one small JSON file per document. `references/scoring-guide.md` 
 
 **A good testing loop:** score your *required* fields first → read the per-field misses → sharpen those field descriptions or normalization rules → re-run → re-score. A few iterations usually gets required-field accuracy where you want it.
 
+**Run each config more than once.** Extraction isn't deterministic, so one run is a draw, not a measurement. Score the same config three times (five for a number you'll quote), report mean and spread, and only treat a change as an improvement when it beats that spread. `score.py --extractions-dir <run> --run-label <name>` scores repeat runs of one config without cloning the config file, and every report opens with a `SCOPE:` line naming what the number covers. Details in `references/scoring-guide.md`.
+
 ## Model options
 
-Your Agent isn't locked to one model. Studio offers a range — lightweight in-house models (great for cost-sensitive or in-VPC deployments) through larger standard and vision-enhanced models — and you can pick a different model per step (e.g. one for classify, another for extract). If you'd like additional models enabled for your account, ask your Upstage contact.
+Your Agent isn't locked to one model. You can pick a different model per step (one for classify, another for extract), across a range that runs from Upstage's own lightweight Solar models — including a vision model, and the option to run them inside your own VPC or on-prem — through larger standard and vision-enhanced models. The Studio UI's model picker is the live list for your account; ask your Upstage contact to enable others.
+
+**Score on the model you will deploy.** If production will run in your VPC, the number that matters comes from the model that can run there. A larger model is worth running as a comparison to see the headroom, but it shouldn't be the one you tuned and quoted.
+
+**Document Parse.** The unpinned `document-parse` alias resolves to the current build, which is usually what you want; pin a build only when you have a reason to, and re-check that reason when you revisit the pipeline.
+
+- **Checkboxes:** builds have differed in how they render a *filled* checkbox. If your documents have checkboxes, parse a sample page on the build you intend to pin and confirm the selected box comes through as a distinct glyph — a build that drops it fails silently and looks like a schema problem downstream.
+- **Long documents:** before you score anything, spot-check a few sentences that cross a page break in the parse output. Continuations across a break are where layout reconstruction is most likely to reorder a word or mistype a fragment as a heading, and a parse problem found on day three invalidates days one and two.
+
+Parse step settings, including `mode: standard | enhanced`, are in `references/schema-guide.md`.
 
 ## Files in this skill
 

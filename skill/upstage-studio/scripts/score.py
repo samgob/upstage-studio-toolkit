@@ -18,6 +18,22 @@ Usage
 -----
   python score.py --config scoring_config.json
 
+Scoring the same config more than once (recommended — extraction is not
+deterministic, so one run is one draw, not a measurement): don't clone the
+config file per run. Point one config at each run's output folder and label
+the run, so the reports don't overwrite each other:
+
+  python score.py --config scoring_config.json \
+      --extractions-dir results/run1 --run-label run1
+  python score.py --config scoring_config.json \
+      --extractions-dir results/run2 --run-label run2
+
+Every report opens with a SCOPE line (documents, cells compared, TN policy,
+run label) so a number is never quoted without the scope it was measured on.
+
+`tn_policy` must be stated explicitly in the config — it changes the
+denominator, so the scorer refuses to pick one for you.
+
 See references/scoring-guide.md and examples/scoring_config.example.json.
 """
 
@@ -34,6 +50,58 @@ from difflib import SequenceMatcher
 def load_json(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+# --------------------------------------------------------------------------- #
+# TN policy — stated, never guessed
+# --------------------------------------------------------------------------- #
+
+# How a cell that is blank in BOTH ground truth and extraction is counted.
+# "credit" is the canonical spelling; "include" is accepted as a synonym so
+# older configs keep working.
+_TN_POLICIES = {"exclude", "credit", "include"}
+
+_TN_POLICY_HELP = (
+    "`tn_policy` must be set explicitly in the scoring config. It decides "
+    "whether cells that are blank in BOTH ground truth and extraction sit in "
+    "the denominator, which moves the headline by whole points on a schema "
+    "with many optional fields — so this scorer will not pick one for you.\n"
+    "  Add ONE of these to the config, and say which you chose whenever you "
+    "quote the number:\n"
+    '    "tn_policy": "exclude"  — both-blank cells dropped from the numerator '
+    "AND the denominator.\n"
+    "                            Standard micro-accuracy; the documented "
+    "headline. Pick this\n"
+    "                            unless you have a stated reason not to.\n"
+    '    "tn_policy": "credit"   — both-blank cells counted as correct '
+    "(a schema-slot view).\n"
+    "                            Rewards correctly-left-blank fields, and "
+    "inflates as you add\n"
+    "                            optional fields — form-completion metrics "
+    "only, and label it\n"
+    "                            as such. (\"include\" is accepted as a "
+    "synonym.)\n"
+    "  See references/scoring-guide.md — 'What it measures'."
+)
+
+
+def require_tn_policy(cfg):
+    """Return the config's tn_policy, or raise ValueError explaining the two
+    real choices. Never defaults: a silent default lets two runs publish
+    different-meaning numbers under the same label."""
+    if "tn_policy" not in cfg:
+        raise ValueError("tn_policy is missing from the scoring config.\n" + _TN_POLICY_HELP)
+    policy = cfg["tn_policy"]
+    if policy not in _TN_POLICIES:
+        raise ValueError(
+            f"tn_policy {policy!r} is not a recognized value.\n" + _TN_POLICY_HELP
+        )
+    return policy
+
+
+def credits_absent_agreement(tn_policy):
+    """True when both-blank cells count toward the score."""
+    return tn_policy in ("credit", "include")
 
 
 # Top-level keys that mark a per-document result *wrapper* (from the batch
@@ -254,6 +322,7 @@ def compare_array(gt_list, ex_list, field, normalize, match="positional", key=No
 def tally(outcomes, tn_policy="exclude"):
     """Turn a list of outcome dicts into TP/FP/FN counts for raw and norm."""
     counts = {}
+    credit_tn = credits_absent_agreement(tn_policy)
     for mode in ("raw", "norm"):
         tp = fp = fn = tn = 0
         for o in outcomes:
@@ -269,8 +338,8 @@ def tally(outcomes, tn_policy="exclude"):
                 fn += 1
             elif r == "absent_agree":
                 tn += 1
-        denom = tp + fp + fn + (tn if tn_policy == "include" else 0)
-        acc = (tp + (tn if tn_policy == "include" else 0)) / denom if denom else 1.0
+        denom = tp + fp + fn + (tn if credit_tn else 0)
+        acc = (tp + (tn if credit_tn else 0)) / denom if denom else 1.0
         counts[mode] = {"tp": tp, "fp": fp, "fn": fn, "tn": tn, "accuracy": acc}
     return counts
 
@@ -283,7 +352,7 @@ def score(cfg):
     gt = load_ground_truth(cfg["ground_truth_dir"])
     raw_ex = load_extractions(cfg["extractions_dir"])
     field_cfg = cfg.get("field_config", {})
-    tn_policy = cfg.get("tn_policy", "exclude")
+    tn_policy = require_tn_policy(cfg)
     rules = []
     if cfg.get("normalization_rules_file"):
         rules = load_json(cfg["normalization_rules_file"]).get("rules", [])
@@ -333,6 +402,8 @@ def score(cfg):
         "close_hits": close_hits,
         "missing_extractions": sorted(set(gt) - set(ex)),
         "tn_policy": tn_policy,
+        "doc_ids": sorted(gt),
+        "n_cells": len(all_outcomes),
     }
 
 
@@ -344,9 +415,27 @@ def pct(x):
     return f"{x * 100:.1f}%"
 
 
+_MAX_DOCS_LISTED = 12
+
+
+def scope_line(res, cfg):
+    """One line naming everything the headline was measured on. It renders
+    above the numbers so a score can't travel without its scope."""
+    docs = res.get("doc_ids", [])
+    if len(docs) > _MAX_DOCS_LISTED:
+        shown = ", ".join(docs[:_MAX_DOCS_LISTED]) + f", +{len(docs) - _MAX_DOCS_LISTED} more"
+    else:
+        shown = ", ".join(docs) if docs else "none paired"
+    return (
+        f"SCOPE: {len(docs)} docs ({shown}) · {res.get('n_cells', 0)} cells compared · "
+        f"tn_policy={res['tn_policy']} · run={cfg.get('run_label') or 'unlabelled'}"
+    )
+
+
 def render_report(res, cfg):
     thr = cfg.get("accuracy_threshold", 0.9)
-    lines = ["# Extraction Accuracy Report", ""]
+    lines = ["# Extraction Accuracy Report", "",
+             "```", scope_line(res, cfg), "```", ""]
     o = res["overall"]
     lines += [
         f"**Overall accuracy** (micro, TN policy = `{res['tn_policy']}`):",
@@ -388,22 +477,75 @@ def render_report(res, cfg):
     return "\n".join(lines)
 
 
+def sanitize_label(label):
+    """Make a run label safe to put in a filename: letters, digits, dash,
+    underscore and dot survive; anything else collapses to a dash."""
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in label.strip())
+    return "-".join(part for part in safe.split("-") if part)
+
+
+def labeled_output_path(base, label):
+    """`accuracy_report.md` + `run2` -> `accuracy_report__run2.md`, so scoring
+    the same config twice doesn't overwrite the first report. Idempotent —
+    re-labelling a labelled path replaces the label instead of stacking."""
+    root, ext = os.path.splitext(base)
+    if "__" in os.path.basename(root):
+        head, sep, _old = root.rpartition("__")
+        root = head if sep else root
+    return f"{root}__{label}{ext}"
+
+
 def main():
     p = argparse.ArgumentParser(description="Score extractions against ground truth.")
     p.add_argument("--config", required=True, help="Path to scoring_config.json")
+    p.add_argument(
+        "--extractions-dir", default=None, metavar="PATH",
+        help="Score this folder of results instead of the config's "
+             "`extractions_dir`, for this run only. Use it to score several "
+             "runs of ONE config (the honest way to see run-to-run spread) "
+             "without cloning the config file. Pair it with --run-label.",
+    )
+    p.add_argument(
+        "--run-label", default=None, metavar="NAME",
+        help="Name this run. The label is added to the report filename "
+             "(`accuracy_report__NAME.md`) so repeat runs don't overwrite each "
+             "other, and it is printed on the report's SCOPE line.",
+    )
     args = p.parse_args()
 
     cfg = load_json(args.config)
-    res = score(cfg)
-    report = render_report(res, cfg)
+
+    if args.extractions_dir is not None:
+        if not os.path.isdir(args.extractions_dir):
+            print(f"ERROR: --extractions-dir {args.extractions_dir!r} is not a "
+                  f"directory.")
+            return 1
+        cfg["extractions_dir"] = args.extractions_dir
 
     out_path = cfg.get("output_report", "accuracy_report.md")
+    if args.run_label is not None:
+        label = sanitize_label(args.run_label)
+        if not label:
+            print(f"ERROR: --run-label {args.run_label!r} leaves nothing usable. "
+                  f"Use letters, digits, '-', '_' or '.'.")
+            return 1
+        cfg["run_label"] = label
+        out_path = labeled_output_path(out_path, label)
+
+    try:
+        res = score(cfg)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    report = render_report(res, cfg)
+
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(report)
 
     print(report)
     print(f"\nReport written to {out_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
