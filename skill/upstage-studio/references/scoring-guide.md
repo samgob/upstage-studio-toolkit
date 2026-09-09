@@ -169,9 +169,11 @@ One small JSON file per document, in your ground-truth folder:
 }
 ```
 
-- `extractions_dir` is where `run_agent.py --output` wrote its per-document JSON
-  (the scorer reads either a plain `{field: value}` object or the step-list
-  `run_agent.py` writes and finds the extraction automatically).
+- `extractions_dir` is where `run_agent.py --output` (or the batch CLI's
+  `results/` folder) wrote its per-document JSON. The scorer reads a plain
+  `{field: value}` object or either runner's per-step output and picks the
+  step whose fields best match the ground truth, so an instruct or validate
+  step in the same file doesn't confuse it.
 - List array-of-object fields under `field_config` with `"type": "array"`.
 - Omit `fields` to score every field present in ground truth.
 - `tn_policy` is **required** — see "What it measures" above. The scorer exits

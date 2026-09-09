@@ -1,69 +1,107 @@
 # Upstage Studio Toolkit
 
-Customer-facing tooling for working with an [Upstage AI Studio](https://studio.upstage.ai)
-document-processing Agent — running documents at scale, editing and versioning
-your schema, and scoring extraction accuracy. Everything here is self-contained
-Python 3.8+ (standard library only) and ships in two forms for two audiences.
+Tools and references for working with an [Upstage AI Studio](https://studio.upstage.ai)
+document-processing **Agent** over the API: run documents through it (one at a
+time or by the folder), read every step's output, edit and version the workflow
+as JSON, and — for proof-of-concept evaluation — score extraction accuracy
+against your own ground truth. Everything is Python 3.8+ standard library:
+nothing to install.
 
-## Two delivery paths
+**Version 2.6.0** — see [CHANGELOG.md](CHANGELOG.md).
 
-| Path | For | What's in it |
-|------|-----|--------------|
-| **`skill/upstage-studio/`** | Technical / AI-native users (drive it with Claude, Codex, etc.) | The Claude skill: API reference, schema-editing and scoring guides, a minimal `run_agent.py` example, the `score.py` accuracy scorer, worked examples, **and** the batch CLI as its at-scale engine. |
-| **`gui/`** | Non-technical users who'd rather click than code | The batch CLI plus a local web GUI (`upstage_batch_gui.py`) — browse to a folder, click Run, watch progress, browse results. |
+## Who this is for
 
-Both are packaged as standalone zips by `build.sh` (see below).
+| You are… | Start with |
+|----------|-----------|
+| **An integrator** wiring a Studio Agent into your own application (any language, any platform) | [`INTEGRATION_QUICKSTART.md`](INTEGRATION_QUICKSTART.md) — the HTTP flow with curl: upload → create job with your correlation ID → poll (no webhooks) → read every step's output → retention, caching, errors, concurrency. Then `skill/upstage-studio/references/agent-api.md` for the full endpoint and per-step reference. |
+| **Evaluating an Agent on your documents** (a POC) | `skill/upstage-studio/SKILL.md` — run a folder, read the results, edit the schema, score accuracy. |
+| **Non-technical** — you want to run a folder of documents and look at the results | `gui/` — a local web GUI over the batch tool (`python3 gui/upstage_batch_gui.py`). |
+| **Using Claude Code or another coding agent** | Install `skill/upstage-studio` as a skill (below) and ask it to run, integrate, or iterate on your Agent. |
 
-## Single source of truth (no fork/fracture)
+## Install
 
-The batch CLI, `core/upstage_batch.py`, is the **one canonical copy**. Both
-delivery paths use it, but neither keeps its own edited version — `build.sh`
-stamps the canonical file into each artifact at build time. So:
-
-- **Edit only `core/upstage_batch.py`.** The copies in `skill/.../scripts/` and
-  `gui/` are build outputs (git-ignored) and get overwritten on every build.
-- Each delivered zip is still fully self-contained — customers never need to
-  assemble anything.
-
-```
-core/upstage_batch.py          ← edit here (the only source)
-skill/upstage-studio/          ← the skill (run_agent.py + score.py are skill-owned)
-gui/upstage_batch_gui.py       ← the web GUI
-build.sh                       ← assembles dist/upstage-studio.zip + dist/upstage-batch-gui.zip
+```bash
+git clone https://github.com/samgob/upstage-studio-toolkit.git
+cd upstage-studio-toolkit
+export UPSTAGE_API_KEY="<key created in the Upstage Console>"
 ```
 
-## Build & deliver
+That's a complete install — every script in the clone runs as-is.
+
+**Claude Code users:** make the skill available by copying or symlinking it
+into your skills directory:
+
+```bash
+ln -s "$(pwd)/skill/upstage-studio" ~/.claude/skills/upstage-studio    # or cp -r
+```
+
+**Everyone else:** run the scripts directly.
+
+## Quick start
+
+```bash
+# One document through your Agent — every step's output, as one JSON file
+python3 skill/upstage-studio/scripts/run_agent.py \
+    --agent agt_XXX --config-id cfg_XXX --input invoice.pdf --output results/
+
+# A folder, at scale (parallel workers, retry/backoff, checkpoint + --resume)
+python3 skill/upstage-studio/scripts/upstage_batch.py agent \
+    --agent-id agt_XXX --config-id cfg_XXX --docs ./invoices/ --workers 5
+
+# Score extraction results against your ground truth (POC evaluation)
+python3 skill/upstage-studio/scripts/score.py \
+    --config skill/upstage-studio/examples/scoring_config.example.json
+```
+
+The per-document JSON both runners write is generic: every step that ran, in
+API order, named as in your config, with split children kept as a list per step
+name — parse, classify, extract, instruct, merge, and validate alike.
+
+## Layout
+
+```
+INTEGRATION_QUICKSTART.md          ← HTTP-first integration guide (start here if you're integrating)
+skill/upstage-studio/
+  SKILL.md                         ← walkthrough (also the Claude skill entry point)
+  scripts/run_agent.py             ← minimal upload → run → poll → JSON, single file or folder
+  scripts/upstage_batch.py         ← the batch CLI (canonical copy; also stamped into gui/ by build.sh)
+  scripts/score.py                 ← accuracy scorer
+  references/agent-api.md          ← endpoint + per-step output reference, worked example
+  references/schema-guide.md       ← the step envelope; parse, schema, classes, instruct, merge, validate
+  references/scoring-guide.md      ← ground-truth format and metric
+  examples/                        ← copy-paste schema / ground-truth / scoring-config templates
+gui/
+  upstage_batch_gui.py             ← local web GUI over the batch CLI
+  README.md
+build.sh                           ← stamps the batch CLI into gui/ and packages dist/*.zip
+CHANGELOG.md
+```
+
+## Building the zips (maintainers)
 
 ```bash
 ./build.sh
-# → dist/upstage-studio.zip       (send to technical users)
-# → dist/upstage-batch-gui.zip    (send to non-technical users)
+# → dist/upstage-studio.zip       (the skill + scripts)
+# → dist/upstage-batch-gui.zip    (batch CLI + web GUI)
 ```
 
-## Security & privacy posture
+`skill/upstage-studio/scripts/upstage_batch.py` is the single source for the
+batch CLI; `gui/upstage_batch.py` is a build-time copy and is git-ignored. Edit
+the skill copy.
 
-- **No secrets or customer data in this repo.** `.gitignore` blocks logs, run
-  outputs, `results/`, `*.rtf`, and anything key-shaped. Keep API keys and real
-  document outputs out of the tree entirely.
-- The GUI serves only loopback requests (validates the `Host` header), fetches
-  no third-party assets, and passes the API key to the batch process via the
-  environment rather than the command line.
+## Security and privacy
+
+- No secrets or customer data live in this repo, and `.gitignore` blocks logs,
+  run outputs, `results/`, and anything key-shaped. Keep API keys and real
+  document outputs out of the tree.
 - API keys are read from `UPSTAGE_API_KEY` (or `--key`), never hard-coded.
+- The GUI serves loopback requests only (it validates the `Host` header),
+  fetches no third-party assets, and passes the API key to the batch process
+  through the environment rather than the command line.
 
-## Changes 2026-09
+## Support
 
-- `score.py` gains `--extractions-dir` and `--run-label`, so you can score
-  several runs of one config without cloning the config file, and every report
-  now opens with a `SCOPE:` line (documents, cells, TN policy, run label).
-- `tn_policy` is now required in the scoring config — the scorer names the two
-  choices instead of silently defaulting one. Scoring math is unchanged.
-- New guidance on measuring honestly: run each config n ≥ 3 times and report the
-  spread, score on the model you'll actually deploy, and get the answer key
-  before writing ground truth (`references/scoring-guide.md`).
-- Schema guide adds the hard schema-size limit and how to measure it, the
-  generic-examples rule, the `json_schema` vs `response_format` envelope, and
-  when to stop editing field descriptions; parse and config-hygiene notes added
-  to `SKILL.md` / `references/agent-api.md`.
+Open an issue on this repository, or contact your Upstage representative.
 
 ## License
 

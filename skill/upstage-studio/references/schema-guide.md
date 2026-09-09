@@ -12,6 +12,58 @@ Agent's default once you're happy with it so UI runs use it too.
 
 ---
 
+## The step envelope (what a config is made of)
+
+A config is a list of **steps**. Every step, whatever its type, has the same
+envelope; only `data` differs by type:
+
+```json
+{
+  "name": "extract_invoice",
+  "type": "information-extract",
+  "data": { "...type-specific settings..." },
+  "is_first": false,
+  "next_steps": [ { "step_name": "check_totals" } ]
+}
+```
+
+| Field | Notes |
+|-------|-------|
+| `name` | Unique within the config. `next_steps` and validate checks refer to steps by this name. For an **extract** step, `name` must equal the schema's `text.format.name` or downstream wiring fails to resolve. |
+| `type` | One of six: `document-parse`, `document-classify`, `information-extract`, `instruct`, `merge`, `validate`. |
+| `data` | Type-specific settings (sections below). **Unknown keys inside `data` are accepted and stored silently at config creation and only fail when a job runs** — check every key against this guide. |
+| `is_first` | Exactly one step carries `true`; it must be the parse step. |
+| `next_steps` | List of `{ "step_name": ..., "condition": {...}? }`. An entry without a `condition` is the fallback. `[]` ends the workflow. |
+
+Order rules: parse first; classify (optional) before extract; instruct anywhere
+after parse; `merge` joins several branches into one; `validate` follows an
+extract, instruct, or merge. A full config example is in `agent-api.md`.
+
+---
+
+## Parse step settings
+
+The parse step (`document-parse`) turns the document into text/HTML that every
+later step reads. Its `data`:
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `model` | `document-parse` | The unpinned alias resolves to the current build; pin a dated build only for a reason. |
+| `mode` | `standard` | `standard` or `enhanced`. |
+| `ocr` | `force` | `force` (always OCR) or `auto` (only when the file has no text layer). |
+| `output_formats` | `["html", "text"]` | Any of `html`, `text`, `markdown`, `pdf`. **Keep `html` whenever an extract follows** — the extract step reads the HTML; `["text"]` alone fails the job at run time. |
+| `coordinates` | `true` | Include element coordinates in the parse output. |
+| `chart_recognition` | `true` | Recognise charts. |
+| `merge_multipage_tables` | `false` | Join tables that span pages. |
+
+```json
+{ "name": "parse", "type": "document-parse",
+  "data": { "ocr": "auto", "output_formats": ["html", "text"], "coordinates": true },
+  "is_first": true, "next_steps": [ { "step_name": "classify" } ] }
+```
+
+---
+
 ## Extraction schema
 
 The extraction step uses a **JSON Schema** describing the fields you want back.
@@ -61,8 +113,11 @@ It lives inside the step's `text.format`:
   no fourth level — a nested object inside a row object won't validate, so
   flatten it into columns on the row.
 - Field names shouldn't start with `_`.
-- `mode` on the step selects the model tier: `standard` or `enhanced`
+- `mode` in the **extract** step's `data` selects `standard` or `enhanced`
   (vision-enhanced; enhanced supports up to 50 pages, standard up to 1,000).
+- `confidence` (default `true`) adds a `high` / `medium` / `low` confidence
+  label per field to the extract output; `location` (default `true`) adds the
+  source location of each value. Both are step settings, not schema keys.
 - **The envelope matters.** The extraction step takes the `json_schema` object
   shown above — `{"type": "json_schema", "name": ..., "schema": {...}}` — on
   its own. Only the **classify** step wraps its schema in a `response_format`
@@ -172,7 +227,29 @@ category and a fallback branch so every document has a home.
 **Splitting combined PDFs.** Set `"split": true` on the classify step and it will
 break a multi-document PDF (e.g. an application + a supplemental + an email in
 one file) into sections, classify each, and route each to its matching schema —
-so you can start straight from a raw package.
+so you can start straight from a raw package. A working split step carries
+**both** a `split_criteria` list and the `text.format` class schema:
+
+```json
+{ "name": "classify", "type": "document-classify",
+  "data": {
+    "split": true,
+    "split_criteria": [
+      { "criterion": "commercial_application", "description": "The main application form." },
+      { "criterion": "supplemental_application", "description": "A supplemental questionnaire." }
+    ],
+    "text": { "format": { "type": "json_schema", "name": "doc_type",
+              "schema": { "type": "string", "oneOf": [ "...as above..." ] } } }
+  },
+  "next_steps": [ "...one conditional branch per class, plus a fallback..." ] }
+```
+
+`split_criteria` (prose, one entry per unit you want split out) drives how pages
+are **grouped**; `text.format` drives the **label** each group gets and is the
+value `next_steps` routes on — it is required even when criteria are present.
+Keep the two lists aligned (same names) so the grouping and the label agree.
+Each split child then flows through the rest of the workflow on its own, and
+comes back in the job output as its own result (see `agent-api.md`).
 
 **Subclasses.** If one class arrives in two very different shapes (a clean form
 vs. a free-text narrative, say), you can split it into two subclasses and give
@@ -199,11 +276,72 @@ a short summary that drives your own automation.
 }
 ```
 
+The prompt lives in `data.input` in exactly that shape — a list with one
+`user` message whose `content` is a list of `input_text` items. **Do not use a
+`prompt` key**: it is accepted and stored when you create the config, and the
+job then fails at run time with "queries are required for instruct".
+
 It automatically receives the parse/classify/extract output as context, so you
 don't wire the data in by hand. Instruct prompts work well as prose; you can add
 a `text.format` if you want a structured result. You can edit the instruct
 prompt by pasting a new prompt into the step, or add/replace instruct steps via
 the API.
+
+---
+
+## Merge and validate
+
+Two utility steps complete the six node types.
+
+**Merge** (`type: "merge"`) joins several branches — typically the per-class
+extract steps after a splitting classify — into one downstream context, so a
+single instruct or validate can see all of them. It has no settings: `data` must
+be `null` (anything else is rejected). Its own output is provenance only (which
+branches arrived, their page ranges); the values stay on the extract steps.
+
+```json
+{ "name": "merge_all", "type": "merge", "data": null,
+  "next_steps": [ { "step_name": "check_completeness" } ] }
+```
+
+**Validate** (`type: "validate"`) runs named checks against extract output and
+emits a three-lane verdict: any failed `error` check → `red`; only `warning`
+checks failed → `yellow`; all pass → `green`.
+
+```json
+{ "name": "check_completeness", "type": "validate",
+  "data": {
+    "checks": [
+      { "name": "invoice number present", "severity": "error",
+        "condition": { "left": { "node": "extract_invoice", "field": "invoice_number" },
+                       "operator": "filled" } },
+      { "name": "total is positive", "severity": "warning",
+        "condition": { "left": { "node": "extract_invoice", "field": "total_amount" },
+                       "operator": "gt", "right": { "const": 0 } } }
+    ]
+  },
+  "next_steps": [
+    { "step_name": "route_auto",   "condition": { "field": "text", "operator": "==", "value": "green" } },
+    { "step_name": "route_review", "condition": { "field": "text", "operator": "==", "value": "yellow" } },
+    { "step_name": "route_reject", "condition": { "field": "text", "operator": "==", "value": "red" } }
+  ] }
+```
+
+- `severity` is `"error"` or `"warning"`, exactly.
+- Nine operators: `filled`, `eq`, `neq`, `gt`, `lt`, `gte`, `lte`, `contains`,
+  `matches` (anchored regex). `filled` takes no `right`; an empty string fails it.
+  `gt`/`lt`/`gte`/`lte` compare as numbers and fail on non-numeric values.
+- An operand is `{ "node": "<extract step name>", "field": "<top-level field>" }`
+  or a literal `{ "const": ... }`. `field` is a flat top-level lookup — there is
+  no path syntax into arrays or nested rows.
+- Checks can be grouped: `{ "logic": "and" | "or", "conditions": [ ... ] }`.
+- Downstream routing branches on `field: "text"` with the lane string — the same
+  mechanism as classify routing.
+- Validate evaluates the full check list once per split child. A check that
+  refers to an extract step that did not run on that child's branch resolves to
+  `null` and fails, so after a splitting classify put a `merge` in front of the
+  validate (then each operand is read across all the branches that arrived), or
+  put one validate on each branch.
 
 ---
 

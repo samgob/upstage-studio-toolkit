@@ -8,17 +8,43 @@ limits. Standard library only; no dependencies to install.
 
 Examples
 --------
-  # One document, print every step's output
-  python run_agent.py --agent agt_XXX --config-id cfg_XXX \
-      --input invoice.pdf --include all
+  # One document; every step's output is included by default
+  python run_agent.py --agent agt_XXX --config-id cfg_XXX --input invoice.pdf
 
-  # A whole folder, 5 in parallel, save each result to results/
+  # A whole folder, 5 in parallel, save one JSON per document to results/
   python run_agent.py --agent agt_XXX --config-id cfg_XXX \
-      --input ./submissions/ --include all --workers 5 --output results/
+      --input ./invoices/ --workers 5 --output results/
+
+  # Only the final step's output
+  python run_agent.py --agent agt_XXX --input invoice.pdf --include last
+
+Output shape (one JSON per document)
+------------------------------------
+  {
+    "document": "invoice.pdf",
+    "job_id": "job_XXX",
+    "status": "completed",
+    "metadata": {"cached": "false", ...},
+    "usage": {...},
+    "steps": [                      # every step, in API order
+      {"index": 0, "name": "parse", "type": "document-parse", "step_id": "...",
+       "content": [
+          {"text": <parsed JSON, or the raw string>,
+           "additional_values": <parsed object, or null>,
+           ...any other keys the API returned on that content entry}
+      ]},
+      ...
+    ],
+    "by_step": {"parse": [content...], "classify": [content...], ...}
+  }
+
+  A step that ran once per split child (e.g. an extract after a splitting
+  classify) has several entries in its "content" list. Nothing is merged or
+  dropped — the file mirrors what the API returned, with JSON strings parsed.
 
 Environment
 -----------
-  UPSTAGE_API_KEY   Your Upstage API key (starts with 'up_'). Or pass --key.
+  UPSTAGE_API_KEY   Your Upstage API key (create one in the Upstage Console). Or pass --key.
 """
 
 import argparse
@@ -127,29 +153,37 @@ def upload_file(path, api_key):
     return file_id  # proceed anyway; job creation will report 409 if not ready
 
 
-def create_job(agent_id, file_id, api_key, *, config_id=None, include="last"):
-    """POST /v2/responses. Returns the job id."""
+def create_job(agent_id, file_id, api_key, *, config_id=None, include="all",
+               metadata=None):
+    """POST /v2/responses. Returns (job_id, raw response).
+
+    `metadata` is an optional dict of your own key/values (e.g. your document
+    ID) that comes back on GET /v2/responses/{job_id} under "metadata"."""
     body = {
         "model": agent_id,
         "input": [{"role": "user",
                    "content": [{"type": "input_file", "file_id": file_id}]}],
         "background": True,
-        "include": [include],   # "last" or "all"
+        "include": [include],   # "all" (every step) or "last" (final step only)
     }
     if config_id:
         body["config_id"] = config_id
+    if metadata:
+        body["metadata"] = metadata
     resp = _request("POST", f"{BASE_URL}/responses", api_key, json_body=body)
     return resp["id"], resp
 
 
-def get_job(job_id, api_key, *, include="last"):
-    """GET /v2/responses/{job_id}. NOTE the bracketed array form ?include[]=all."""
+def get_job(job_id, api_key, *, include="all"):
+    """GET /v2/responses/{job_id}. NOTE the bracketed array form ?include[]=all
+    (the unbracketed ?include=all is ignored and you get only the last step)."""
     url = f"{BASE_URL}/responses/{job_id}?include[]={include}"
     return _request("GET", url, api_key)
 
 
-def poll_job(job_id, api_key, *, include="last", timeout=2400, interval=4):
-    """Poll a job until it completes or fails."""
+def poll_job(job_id, api_key, *, include="all", timeout=2400, interval=4):
+    """Poll a job until it completes or fails. Polling is the only completion
+    signal — the API has no webhooks."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         job = get_job(job_id, api_key, include=include)
@@ -164,11 +198,13 @@ def poll_job(job_id, api_key, *, include="last", timeout=2400, interval=4):
     raise TimeoutError(f"Job {job_id} did not finish within {timeout}s")
 
 
-def run_one(path, agent_id, api_key, *, config_id=None, include="last"):
+def run_one(path, agent_id, api_key, *, config_id=None, include="all",
+            metadata=None):
     """Full flow for a single document. Returns the completed job dict."""
     file_id = upload_file(path, api_key)
     job_id, _ = create_job(agent_id, file_id, api_key,
-                           config_id=config_id, include=include)
+                           config_id=config_id, include=include,
+                           metadata=metadata)
     return poll_job(job_id, api_key, include=include)
 
 
@@ -176,26 +212,59 @@ def run_one(path, agent_id, api_key, *, config_id=None, include="last"):
 # Output shaping
 # --------------------------------------------------------------------------- #
 
-def extract_steps(job):
-    """Pull each step's text output out of a completed job into a tidy dict.
-    Extraction/classification outputs are JSON strings; parse them when we can."""
+def _parse_json_maybe(value):
+    """Return json.loads(value) when value is a string holding JSON, else value."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
+
+
+def shape_job(job, document=None):
+    """Turn a completed job into the per-document JSON this script writes.
+
+    The API returns one item in `output[]` per step that ran, in execution
+    order; the step's name is the item's `model` key and its type (document-parse,
+    document-classify, information-extract, instruct, merge, validate) is the
+    item's `step_type` key. Each item carries a
+    `content[]` list with one entry per result — several when the step ran
+    once per split child. `text` is the step's output (a JSON string for
+    classify / extract / validate / merge; free text for instruct; the parsed
+    document JSON, with content.html inside, for parse) and `additional_values` is a JSON *string* holding per-step
+    extras (classify confidence and page ranges, validate check trace,
+    merge provenance). Both are parsed here when they parse.
+
+    No assumptions are made about how many steps ran or what types they are.
+    """
     steps = []
-    for item in job.get("output", []):
-        for part in item.get("content", []):
-            if part.get("type") != "output_text":
-                continue
-            text = part.get("text", "")
-            try:
-                value = json.loads(text)
-            except (json.JSONDecodeError, TypeError):
-                value = text
-            steps.append({
-                "step_index": part.get("step_index"),
-                "step_id": part.get("step_id"),
-                "output": value,
-            })
-    steps.sort(key=lambda s: (s["step_index"] is None, s["step_index"]))
-    return steps
+    by_step = {}
+    for i, item in enumerate(job.get("output") or []):
+        name = item.get("model") or f"step_{i}"
+        contents = []
+        for part in item.get("content") or []:
+            entry = dict(part)
+            entry["text"] = _parse_json_maybe(part.get("text"))
+            av = _parse_json_maybe(part.get("additional_values"))
+            entry["additional_values"] = av if isinstance(av, (dict, list)) else None
+            contents.append(entry)
+        steps.append({"index": i, "name": name, "type": item.get("step_type"),
+                      "step_id": item.get("step_id"), "content": contents})
+        by_step.setdefault(name, []).extend(contents)   # list per name, never overwrite
+
+    shaped = {
+        "document": document,
+        "job_id": job.get("id"),
+        "status": job.get("status"),
+        "metadata": job.get("metadata"),
+        "usage": job.get("usage"),
+        "steps": steps,
+        "by_step": by_step,
+    }
+    if job.get("error"):
+        shaped["error"] = job["error"]
+    return shaped
 
 
 # --------------------------------------------------------------------------- #
@@ -224,8 +293,9 @@ def main():
                         "Omit to run the Agent's default config.")
     p.add_argument("--key", default=os.environ.get("UPSTAGE_API_KEY"),
                    help="API key (or set UPSTAGE_API_KEY)")
-    p.add_argument("--include", choices=["last", "all"], default="last",
-                   help="'last' = final step only; 'all' = every step's output")
+    p.add_argument("--include", choices=["all", "last"], default="all",
+                   help="'all' (default) = every step's output; "
+                        "'last' = final step only")
     p.add_argument("--workers", type=int, default=5,
                    help="Parallel jobs for folder runs (default 5)")
     p.add_argument("--output", default=None,
@@ -260,15 +330,16 @@ def main():
             name = os.path.basename(path)
             try:
                 _, job = fut.result()
-                steps = extract_steps(job)
-                results[name] = steps
+                shaped = shape_job(job, document=name)
+                results[name] = shaped
                 cached = (job.get("metadata") or {}).get("cached")
                 tag = " (cached)" if cached == "true" else ""
-                print(f"  [ok] {name} — {len(steps)} step(s){tag}")
+                names = ", ".join(st["name"] for st in shaped["steps"])
+                print(f"  [ok] {name} — {len(shaped['steps'])} step(s){tag}: {names}")
                 if args.output:
                     stem = os.path.splitext(name)[0]
                     with open(os.path.join(args.output, f"{stem}.json"), "w") as f:
-                        json.dump(steps, f, indent=2, ensure_ascii=False)
+                        json.dump(shaped, f, indent=2, ensure_ascii=False)
             except Exception as e:  # noqa: BLE001 — report, keep going
                 failures[name] = str(e)
                 print(f"  [fail] {name} — {e}")

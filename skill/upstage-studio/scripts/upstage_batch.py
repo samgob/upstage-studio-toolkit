@@ -17,7 +17,7 @@ Features:
   - HTML summary report
   - Config file support (JSON) with CLI overrides
   - Agent cloning (agent-clone subcommand)
-  - Per-step include filters (output:parse, output:extract, etc.)
+  - Every step's output captured by default (include=all), one list per step name
   - Job statistics (stats subcommand)
   - Per-step error code grouping in failure summaries
 
@@ -43,12 +43,12 @@ Usage:
     python3 upstage_batch.py agent --agent-id agt_XXXXX --docs ./my_documents/ --resume
 
 Environment:
-    UPSTAGE_API_KEY — required. Your Upstage API key (starts with up_).
+    UPSTAGE_API_KEY — required. Your Upstage API key (create one in the Upstage Console).
 
 Author: Upstage AI — Solutions Engineering
 """
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 import json
 import urllib.request
@@ -263,8 +263,8 @@ def get_api_key(cli_key: str = None) -> str:
     key = (cli_key or "").strip() or os.environ.get("UPSTAGE_API_KEY", "").strip()
     if not key:
         print("ERROR: No API key provided.")
-        print("Provide it via:  --key up_YOUR_KEY")
-        print("           or:   export UPSTAGE_API_KEY='up_YOUR_KEY'")
+        print("Provide it via:  --key <your-api-key>")
+        print("           or:   export UPSTAGE_API_KEY='<your-api-key>'")
         sys.exit(1)
     return key
 
@@ -612,6 +612,16 @@ def v2_upload_file(file_path: Path, api_key: str,
             upload_path.unlink()
 
 
+def _parse_json_maybe(value):
+    """json.loads(value) when value is a string holding JSON; otherwise value."""
+    if not isinstance(value, str) or not value:
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
+
+
 def v2_create_job(file_id: str, agent_id: str, api_key: str,
                   config_id: Optional[str] = None,
                   include: List[str] = None,
@@ -620,7 +630,7 @@ def v2_create_job(file_id: str, agent_id: str, api_key: str,
     payload = {
         "model": agent_id,
         "input": [{"role": "user", "content": [{"type": "input_file", "file_id": file_id}]}],
-        "include": include or ["last"],
+        "include": include or ["all"],
     }
     if config_id:
         payload["config_id"] = config_id
@@ -663,7 +673,8 @@ def v2_poll_job(job_id: str, api_key: str, include: List[str] = None,
                     "job_id": job_id,
                     "recoverable": True}
 
-        inc = include or ["last"]
+        inc = include or ["all"]
+        # GET /v2/responses/{id} takes the BRACKETED form and only last|all.
         qs = "&".join(f"include[]={v}" for v in inc)
         result = api_request(
             "GET", f"{V2_BASE}/responses/{job_id}?{qs}",
@@ -762,43 +773,41 @@ def v2_process_one(file_path: Path, agent_id: str, api_key: str,
     result["status"] = job_result.get("status")
     result["usage"] = job_result.get("usage", {})
 
-    # Extract the output content
-    output = job_result.get("output", [])
+    # Shape the output generically: one entry per step in API order (the step
+    # name is the output item's `model` key), and a LIST of content entries per
+    # step — a step that ran once per split child has several. `text` is parsed
+    # when it holds JSON; `additional_values` is a JSON string from the API
+    # (classify confidence / page ranges, validate check trace, merge
+    # provenance) and is parsed too.
+    output = job_result.get("output", []) or []
+    steps = []
+    extracted = {}
+    for i, step in enumerate(output):
+        step_name = step.get("model") or f"step_{i}"
+        entries = []
+        for content in step.get("content", []) or []:
+            entries.append({
+                "data": _parse_json_maybe(content.get("text", "")),
+                "additional_values": _parse_json_maybe(content.get("additional_values")),
+            })
+        steps.append({"index": i, "name": step_name, "type": step.get("step_type"),
+                      "step_id": step.get("step_id"), "content": entries})
+        extracted.setdefault(step_name, []).extend(entries)   # never overwrite
     if output:
-        extracted = {}
-        for step in output:
-            step_model = step.get("model", "unknown")
-            contents = step.get("content", [])
-            for content in contents:
-                text = content.get("text", "")
-                try:
-                    parsed = json.loads(text) if text else text
-                except (json.JSONDecodeError, TypeError):
-                    parsed = text
-                extracted[step_model] = {
-                    "data": parsed,
-                    "additional_values": content.get("additional_values"),
-                }
+        result["steps"] = steps
         result["extracted"] = extracted
-
-        # Also set a convenience "final_output" from the last step
-        if output:
-            last_step = output[-1]
-            last_content = last_step.get("content", [{}])
-            if last_content:
-                text = last_content[0].get("text", "")
-                try:
-                    result["final_output"] = json.loads(text) if text else text
-                except (json.JSONDecodeError, TypeError):
-                    result["final_output"] = text
+        # Convenience "final_output" from the last step: the single value when
+        # the step produced one result, a list when it ran per split child.
+        last_values = [e["data"] for e in steps[-1]["content"]] if steps else []
+        if len(last_values) == 1:
+            result["final_output"] = last_values[0]
+        elif last_values:
+            result["final_output"] = last_values
     else:
         # Try output_text shortcut
         ot = job_result.get("output_text")
         if ot:
-            try:
-                result["final_output"] = json.loads(ot) if isinstance(ot, str) else ot
-            except (json.JSONDecodeError, TypeError):
-                result["final_output"] = ot
+            result["final_output"] = _parse_json_maybe(ot)
 
     result["duration_seconds"] = round(time.time() - start_time, 2)
     return result
@@ -1753,7 +1762,7 @@ def generate_sample_config(output_path: Path):
         "docs": "./documents/",
         "output": "./batch_output/",
         "parallel": 3,
-        "include": "last",
+        "include": "all",
         "report": True,
         "v1_options": {
             "_comment": "Only used for v1-parse, v1-extract, v1-classify modes",
@@ -1824,8 +1833,9 @@ Examples:
     p_agent.add_argument("--agent-id", "--agent", type=str, dest="agent_id",
                          help="Studio agent ID (agt_XXXXX)")
     p_agent.add_argument("--config-id", type=str, help="Agent config version ID (optional)")
-    p_agent.add_argument("--include", nargs="+", default=["last"],
-                         help="Include step(s): last, all, or per-step filters (output:parse, output:classify, output:extract, output:instruct)")
+    p_agent.add_argument("--include", choices=["all", "last"], default=None,
+                         help="'all' (default) = every step's output; 'last' = final step only. "
+                              "(GET /v2/responses/{id} accepts only these two values.)")
     _add_common_args(p_agent)
 
     # -- agent-clone --
@@ -1938,7 +1948,7 @@ def _interactive_wizard():
         else:
             api_key = input("  Enter API key: ").strip()
     else:
-        api_key = input("\n  Enter Upstage API key (up_...): ").strip()
+        api_key = input("\n  Enter Upstage API key (from the Upstage Console): ").strip()
 
     if not api_key:
         print("  ERROR: API key is required.")
@@ -2027,7 +2037,7 @@ def _interactive_wizard():
     if command == "agent":
         args.agent_id = agent_id
         args.config_id = config_id
-        args.include = ["last"]
+        args.include = ["all"]
     elif command == "v1-parse":
         args.model = "document-parse"
         args.ocr = "auto"
@@ -2239,11 +2249,17 @@ def main():
             sys.exit(1)
 
         config_id = getattr(args, "config_id", None) or cfg.get("config_id")
-        # include is now a List[str] from nargs="+"
-        include = args.include if args.include != ["last"] else cfg.get("include", ["last"])
-        if isinstance(include, str):
-            # Handle config file where include might be a string
-            include = include.split() if " " in include else [include]
+        # --include on the CLI wins; then the config file; then "all".
+        include = args.include or cfg.get("include") or "all"
+        if isinstance(include, list):
+            include = include[0] if include else "all"
+        include = str(include).strip().lower()
+        if include not in ("all", "last"):
+            print(f"ERROR: include must be 'all' or 'last' (got {include!r}). "
+                  f"Per-step filters such as output:extract are not accepted by "
+                  f"GET /v2/responses/{{id}}.")
+            sys.exit(1)
+        include = [include]
         mode = "v2-agent"
 
         if getattr(args, "dry_run", False):

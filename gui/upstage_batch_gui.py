@@ -427,7 +427,7 @@ def get_html():
 
     <label>API Key</label>
     <div class="key-row">
-      <input type="password" id="apiKey" placeholder="up_your-key-here">
+      <input type="password" id="apiKey" placeholder="paste your API key">
       <button class="key-toggle" onclick="toggleKey()">Show</button>
     </div>
 

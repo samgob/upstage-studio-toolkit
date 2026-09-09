@@ -10,11 +10,12 @@ users who'd rather click and drag than write code.
 python3 upstage_batch_gui.py
 ```
 
-Your browser opens automatically. Paste your API key (from
-[studio.upstage.ai](https://studio.upstage.ai)), your Agent ID (`agt_...`) and
-optional Config ID (`cfg_...`), pick a folder of documents, and click **Run
-Batch**. Progress streams live; when it finishes you get a sortable results
-table with a click-to-expand JSON view per document.
+Your browser opens automatically. Paste your API key (created in the Upstage
+Console at [console.upstage.ai](https://console.upstage.ai)), your Agent ID
+(`agt_...`, from [studio.upstage.ai](https://studio.upstage.ai)) and optional
+Config ID (`cfg_...`), pick a folder of documents, and click **Run Batch**.
+Progress streams live; when it finishes you get a sortable results table with a
+click-to-expand JSON view per document.
 
 Prefer the command line?
 
@@ -36,3 +37,7 @@ CLI output, optional `pikepdf` for auto-repairing corrupted PDF headers).
   fetched to render the UI.
 - Results, logs, and checkpoints are written to an output folder next to your
   documents (or a folder you choose). Interrupted runs resume with `--resume`.
+- Each document's result JSON carries every step the Agent ran (`steps`, in
+  order) and a per-step-name list (`extracted`), so split children and
+  validate / merge steps are all there. `upstage_batch.py` here is a copy of
+  `skill/upstage-studio/scripts/upstage_batch.py` in the toolkit repo.

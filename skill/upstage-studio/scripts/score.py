@@ -110,30 +110,49 @@ _WRAPPER_KEYS = {
     "document", "file_path", "file_size", "mode", "agent_id", "success",
     "timestamp", "duration_seconds", "job_id", "file_id", "status", "usage",
     "error", "error_code", "extracted", "final_output", "raw_response",
-    "recoverable",
+    "recoverable", "steps", "by_step", "metadata",
 }
+
+
+def _dicts_in(value):
+    """Yield every dict found in value (a dict, or a list of dicts/lists)."""
+    if isinstance(value, dict):
+        yield value
+    elif isinstance(value, list):
+        for v in value:
+            yield from _dicts_in(v)
 
 
 def candidate_dicts(obj):
     """Collect every plausible 'extracted fields' dict from any supported
-    result shape: a plain {field: value} dict, run_agent.py's step-list, or a
-    batch-runner wrapper ({document, success, extracted, final_output, ...})."""
+    result shape:
+      - a plain {field: value} dict;
+      - run_agent.py's per-document JSON ({job_id, status, steps, by_step}),
+        where each step's content[].text is the parsed step output;
+      - the batch runner's wrapper ({document, success, extracted, final_output,
+        steps, ...}), where extracted is {step_name: [{data, additional_values}]};
+      - the pre-2.6 shapes (a step list of {step_index, step_id, output}, or
+        extracted as {step_name: {data, ...}})."""
     cands = []
     if isinstance(obj, dict):
-        # run_agent single-step {step_index, step_id, output}
+        # pre-2.6 run_agent single-step {step_index, step_id, output}
         if "output" in obj and set(obj) <= {"step_index", "step_id", "output"}:
             return candidate_dicts(obj["output"])
-        # batch-runner wrapper: pull the per-step data + the final output
-        if {"extracted", "final_output"} & set(obj) and _WRAPPER_KEYS & set(obj):
+        if _WRAPPER_KEYS & set(obj) and (
+                {"extracted", "final_output", "steps", "by_step"} & set(obj)):
             fo = obj.get("final_output")
-            if isinstance(fo, dict):
-                cands.append(fo)
-            extracted = obj.get("extracted")
-            if isinstance(extracted, dict):
+            cands.extend(_dicts_in(fo))
+            for step in obj.get("steps") or []:
+                for entry in (step.get("content") or []) if isinstance(step, dict) else []:
+                    if isinstance(entry, dict):
+                        cands.extend(_dicts_in(entry.get("text", entry.get("data"))))
+            extracted = obj.get("extracted") or obj.get("by_step") or {}
+            if isinstance(extracted, dict) and not obj.get("steps"):
                 for step in extracted.values():
-                    data = step.get("data") if isinstance(step, dict) else step
-                    if isinstance(data, dict):
-                        cands.append(data)
+                    for entry in _dicts_in(step):
+                        val = entry.get("data", entry.get("text")) if (
+                            {"data", "text", "additional_values"} & set(entry)) else entry
+                        cands.extend(_dicts_in(val))
             return cands
         # a plain field dict
         return [obj]
