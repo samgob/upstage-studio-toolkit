@@ -66,7 +66,7 @@ xls, xlsx, hwp, hwpx. **Max 500 MB / 1,000 pages.**
 | `config_id` | no | Pin an exact config version. Accepts `cfg_...` **or** its version number (`"1"`, `"2"`, …). Omit → the Agent's current default config runs. |
 | `background` | no | Auto-true for `agt_` agents; then poll for results |
 | `include` | no | `["last"]` (default, final step only) or `["all"]` (every step's output) |
-| `metadata` | no | A JSON object of your own key/values. It is returned unchanged on `GET /v2/responses/{job_id}` (alongside the server's own `source` and `cached` keys), so use it to carry your document ID or correlation ID. |
+| `metadata` | no | A JSON object of your own key/values. Accepted on job creation but, on the current API, **not returned** on reads (create response, `GET /v2/responses/{job_id}`, jobs list) — only server-set keys such as `source` come back. Keep your own job-ID → document map; the reference scripts key results by filename. The example above shows it as accepted, not returned. |
 
 **Three ways to supply the file** (pick one per `content[]` item):
 
@@ -97,8 +97,9 @@ seconds with a ceiling of the server's own 1-hour job timeout.
 `include[]` accepts exactly two values: `all` (every step's output) and `last`
 (final step only, the default). Two things bite here:
 
-- **Bracket it.** `?include[]=all` works; the unbracketed `?include=all` is
-  silently ignored and you get only the last step.
+- **Bracket it.** Use the bracketed form `?include[]=all`; it has worked
+  consistently. The unbracketed `?include=all` has been observed to be ignored
+  (you then get only the last step).
 - **Only `last` | `all`.** Per-step filters such as `include[]=output:extract`
   are for the jobs-list endpoint (section 5) and return `400` here.
 
@@ -123,8 +124,9 @@ seconds with a ceiling of the server's own 1-hour job timeout.
     }
   ],
   "usage": { "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 },
-  "metadata": { "source": "api", "cached": "false", "your_document_id": "INV-000123" },
-  "created_at": 1700000000
+  "metadata": { "source": "api" },
+  "created_at": 1700000000,
+  "expires_at": 1702592000
 }
 ```
 
@@ -141,8 +143,13 @@ How to read `output[]`:
 - **`content[]` holds the results.** One entry when the step ran once. After a
   splitting classify, steps that run **once per split child** return one entry
   per child under a single item — the classify step itself, and any instruct or
-  validate downstream of a `merge`. (Per-branch extracts, by contrast, arrive as
-  separate items.) Always iterate `content[]`.
+  validate downstream of a `merge`. After a `merge`, instruct and validate
+  return one `content[]` entry per split child and those entries are
+  byte-identical (the step saw the merged context). (Per-branch extracts, by
+  contrast, arrive as separate items.) Always iterate `content[]`.
+- **Each output item carries its own `status`** (`completed` / `failed`). On a
+  `failed` job, `output[]` still holds every step that completed and the
+  failing step is named in `error.step` (section 7).
 - **`content[].text`** is the step's output. For classify, extract, validate
   and merge it is a JSON string — parse it. For instruct it is the model's
   reply (JSON only if you set a `text.format` on the step). For parse it is
@@ -169,7 +176,12 @@ Statuses: `in_progress`, `completed`, `failed`. A `failed` job carries
 
 Lane rule for validate: any failed `error`-severity check → `red`; only
 `warning` checks failed → `yellow`; all pass → `green`. With a splitting
-classify upstream, validate emits one result per split child.
+classify upstream, validate emits one result per split child (identical
+entries when it runs after a merge).
+
+Two further `additional_values` keys have been observed that are not in the
+table above: `citations` on instruct and `hierarchy` on classify. Treat them
+as undocumented — read them if useful, don't build on their shape.
 
 ### Worked example — a supplier certificate packet
 
@@ -182,7 +194,7 @@ produces this (`text` / `additional_values` shown parsed, values abridged):
 {
   "id": "job_XXX",
   "status": "completed",
-  "metadata": { "source": "api", "cached": "false", "your_document_id": "PKT-0001" },
+  "metadata": { "source": "api" },
   "output": [
     { "model": "parse", "step_type": "document-parse",
       "content": [ { "type": "output_text",
@@ -253,7 +265,8 @@ Things to notice:
   items**, while the classify step lists all three children in one item. Key by
   step name and collect lists. (The instruct and validate steps are shown with
   one entry each for brevity; on a live split job they carry one entry per
-  child, each with its own `page_ranges`.)
+  child. After a `merge` those entries are byte-identical — the step saw the
+  merged context — so reading the first one loses nothing.)
 - `page_ranges` is how you tie a child result back to the pages of the file.
 - The validate verdict is `yellow` because only a `warning` check failed; a
   downstream `next_steps` condition on `{"field": "text", "operator": "==", "value": "yellow"}`
@@ -356,8 +369,19 @@ A `failed` job carries `error.code`, `error.message`, and (for step failures) `e
 | `instruct_error` | Instruct step failed | Retry |
 | `tool_execution_error` | Tool execution error | Retry |
 | `timeout_error` | A model call timed out ("Request timed out. Please try again later."); `error.step` names the step | Retry the job |
+| `invalid_request_error` | The config is invalid at run time (`error.step` names the step) | Fix the config; don't retry |
 | `job_timeout_error` | Over the 1-hour processing cap | Reduce pages / split |
 | `server_error` | Transient server issue | Retry; contact support if persistent |
+
+**A failed job still returns partial output.** `output[]` holds every step that
+completed before the failure, each item with its own `status`
+(`completed` / `failed`), and `error.step` names the failing step. Observed:
+`{"code": "timeout_error", "step": "instruct", "message": "Request timed out.
+Please try again later."}` with 10 of 11 steps present. Persist what you got
+before retrying; on the retry the completed steps are served from cache, so a
+retry mostly re-runs the step that failed. A multi-step job with an instruct
+step commonly runs one to several minutes — `in_progress` for 60–120 s is
+normal, not a hang.
 
 HTTP-level: `400` = invalid request (including `include[]=output:*` on
 `/responses/{id}`); `404` = unknown ID; `409` = file still converting (wait for
@@ -378,13 +402,15 @@ Enhanced-mode extraction is limited to 50 pages ("This document exceeds the
 ## 8. Caching
 
 Identical file + identical step settings reuse prior results for **7 days**.
-`metadata.cached` is `"true"` when every step was served from cache, and each
-step's `additional_values.cache_hit` says whether *that* step was. To force a
-fresh run, change any step setting (or the schema) so the inputs differ.
+`metadata.cached` may be absent on completed jobs (it was, even when steps
+were cache hits); treat a missing key as not-fully-cached and rely on each
+step's `additional_values.cache_hit`, which says whether *that* step was
+served from cache. To force a fresh run, change any step setting (or the
+schema) so the inputs differ.
 
 For an integration this is a feature — re-submitting the same document to the
 same config is cheap and returns the same answer. For measurement it matters:
 two runs that return byte-identical output are one draw served twice, not two
-draws. Change something about the input before you re-run, and treat
-`metadata.cached` as a hint rather than proof — the output itself is the
+draws. Change something about the input before you re-run, and treat the
+`cache_hit` flags as a hint rather than proof — the output itself is the
 evidence.

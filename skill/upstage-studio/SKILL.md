@@ -13,7 +13,7 @@ Three things this skill helps you do:
 2. **Edit and version** your extraction schema, class map, instruct prompt, and validate checks as plain JSON.
 3. **Score** extraction results against your own ground truth to measure accuracy field by field (for proof-of-concept evaluation).
 
-**Integrating from your own application (any language)?** Start with [`INTEGRATION_QUICKSTART.md`](../../INTEGRATION_QUICKSTART.md) at the repo root — the HTTP-level flow with curl, per-step output shapes, retention, caching, and error handling. The scripts here are a reference implementation of the same calls.
+**Integrating from your own application (any language)?** Start with `INTEGRATION_QUICKSTART.md` in the toolkit repository (at the repo root, alongside this skill's folder) — the HTTP-level flow with curl, per-step output shapes, retention, caching, and error handling. The scripts here are a reference implementation of the same calls.
 
 Toolkit version: **2.6.0** (see `CHANGELOG.md` at the repo root).
 
@@ -52,12 +52,12 @@ python scripts/score.py --config examples/scoring_config.example.json
 An Agent job is three API calls. `scripts/run_agent.py` does all three for you; the sequence is worth knowing when you integrate it into your own code:
 
 1. **Upload the file** → `POST /v2/files` returns a `file_id`. The file is ready for jobs once its status is `UPLOADED` (page-image conversion runs first — the script waits for you).
-2. **Create the job** → `POST /v2/responses` with your `model` (the Agent ID), optional `config_id` (the version pin), the `file_id`, `include: ["all"]` to get every step's output, and an optional `metadata` object carrying your own identifiers (e.g. your document ID) so you can correlate results.
+2. **Create the job** → `POST /v2/responses` with your `model` (the Agent ID), optional `config_id` (the version pin), the `file_id`, and `include: ["all"]` to get every step's output. A `metadata` object is accepted here but, on the current API, is **not returned** on reads — only server-set keys such as `source` come back — so keep your own job-ID → document map (the scripts key results by filename).
 3. **Poll for the results** → `GET /v2/responses/{job_id}?include[]=all` until `status` is `completed` or `failed`. **Polling is the only completion signal — there are no webhooks.**
 
 **Reading the output.** The response's `output[]` has one item per step that ran, in execution order. The step's **name** is the item's `model` key; its results are in `content[]` — one entry normally, several when the step ran once per split child. `content[].text` holds the step's output (a JSON string for classify, extract, validate, and merge; parse it), and `content[].additional_values` is a JSON string of per-step extras (classify confidence and page ranges, validate check trace, merge provenance). `run_agent.py` writes this as one JSON per document: `steps[]` in API order plus a `by_step` map of name → list of results. See `references/agent-api.md` for the per-step shapes and a worked multi-step example.
 
-**Getting every step's output.** By default a job returns only the *last* step. To get all of them, pass `include: ["all"]` when creating the job, and use the **bracketed array form** `?include[]=all` when reading it back (the unbracketed form is ignored). `run_agent.py` defaults to `all`; pass `--include last` for the final step only.
+**Getting every step's output.** By default a job returns only the *last* step. To get all of them, pass `include: ["all"]` when creating the job, and use the **bracketed array form** `?include[]=all` when reading it back — it has worked consistently, while the unbracketed form has been observed to be ignored (you then get only the last step). `run_agent.py` defaults to `all`; pass `--include last` for the final step only. A `failed` job still returns every step that completed, with `error.step` naming the failing step; the scripts write that partial output rather than discarding it.
 
 **Version pinning.** Pass `config_id` (or its version number) on every job so you always run the exact workflow version you validated. Omit it and the Agent runs its current default.
 

@@ -113,8 +113,9 @@ It lives inside the step's `text.format`:
   no fourth level — a nested object inside a row object won't validate, so
   flatten it into columns on the row.
 - Field names shouldn't start with `_`.
-- `mode` in the **extract** step's `data` selects `standard` or `enhanced`
-  (vision-enhanced; enhanced supports up to 50 pages, standard up to 1,000).
+- `mode` in the **extract** step's `data` selects `standard`, `enhanced`
+  (vision-enhanced; enhanced supports up to 50 pages, standard up to 1,000),
+  or `auto` (the service picks per document).
 - `confidence` (default `true`) adds a `high` / `medium` / `low` confidence
   label per field to the extract output; `location` (default `true`) adds the
   source location of each value. Both are step settings, not schema keys.

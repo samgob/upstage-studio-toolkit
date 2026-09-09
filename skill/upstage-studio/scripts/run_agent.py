@@ -23,24 +23,31 @@ Output shape (one JSON per document)
   {
     "document": "invoice.pdf",
     "job_id": "job_XXX",
-    "status": "completed",
-    "metadata": {"cached": "false", ...},
+    "status": "completed",           # or "failed" — see below
+    "metadata": {"source": "api"},   # server-set keys only; client metadata is not returned
     "usage": {...},
     "steps": [                      # every step, in API order
       {"index": 0, "name": "parse", "type": "document-parse", "step_id": "...",
+       "status": "completed",       # per-step status: completed / failed
        "content": [
           {"text": <parsed JSON, or the raw string>,
-           "additional_values": <parsed object, or null>,
+           "additional_values": <parsed object, or the raw string, or null>,
            ...any other keys the API returned on that content entry}
       ]},
       ...
     ],
-    "by_step": {"parse": [content...], "classify": [content...], ...}
+    "by_step": {"parse": [content...], "classify": [content...], ...},
+    "error": {"code": "...", "step": "...", "message": "..."}   # failed jobs only
   }
 
   A step that ran once per split child (e.g. an extract after a splitting
   classify) has several entries in its "content" list. Nothing is merged or
   dropped — the file mirrors what the API returned, with JSON strings parsed.
+
+  A job that FAILS still returns every step that completed before the failure,
+  so the file is written either way (status "failed", plus "error" naming the
+  failing step). The document counts as a failure for the exit code, but a
+  folder run keeps going and nothing already computed is thrown away.
 
 Environment
 -----------
@@ -141,8 +148,9 @@ def upload_file(path, api_key):
                                "purpose": "user_data"})
     file_id = resp["id"]
 
-    # Image conversion runs after upload; poll until the file is job-ready.
-    for _ in range(60):
+    # Image conversion runs after upload; poll until the file is job-ready
+    # (~300 s ceiling — large PDFs can take minutes to convert).
+    for _ in range(150):
         info = _request("GET", f"{BASE_URL}/files/{file_id}?view=status", api_key)
         status = str(info.get("status", "")).upper()
         if status in ("UPLOADED", "READY"):
@@ -157,8 +165,10 @@ def create_job(agent_id, file_id, api_key, *, config_id=None, include="all",
                metadata=None):
     """POST /v2/responses. Returns (job_id, raw response).
 
-    `metadata` is an optional dict of your own key/values (e.g. your document
-    ID) that comes back on GET /v2/responses/{job_id} under "metadata"."""
+    `metadata` is an optional dict of your own key/values. The API accepts it
+    but, on the current API, does NOT return it on reads — only server-set keys
+    such as "source" come back. Keep your own job-ID -> document map (this
+    script keys results by filename)."""
     body = {
         "model": agent_id,
         "input": [{"role": "user",
@@ -170,37 +180,46 @@ def create_job(agent_id, file_id, api_key, *, config_id=None, include="all",
         body["config_id"] = config_id
     if metadata:
         body["metadata"] = metadata
-    resp = _request("POST", f"{BASE_URL}/responses", api_key, json_body=body)
+    try:
+        resp = _request("POST", f"{BASE_URL}/responses", api_key, json_body=body)
+    except RuntimeError as e:
+        # 409 = the file is still converting. Wait once and try again.
+        if "HTTP 409" not in str(e):
+            raise
+        time.sleep(15)
+        resp = _request("POST", f"{BASE_URL}/responses", api_key, json_body=body)
     return resp["id"], resp
 
 
 def get_job(job_id, api_key, *, include="all"):
-    """GET /v2/responses/{job_id}. NOTE the bracketed array form ?include[]=all
-    (the unbracketed ?include=all is ignored and you get only the last step)."""
+    """GET /v2/responses/{job_id}. Use the bracketed array form ?include[]=all;
+    it has worked consistently. The unbracketed ?include=all has been observed
+    to be ignored (you then get only the last step)."""
     url = f"{BASE_URL}/responses/{job_id}?include[]={include}"
     return _request("GET", url, api_key)
 
 
 def poll_job(job_id, api_key, *, include="all", timeout=2400, interval=4):
     """Poll a job until it completes or fails. Polling is the only completion
-    signal — the API has no webhooks."""
+    signal — the API has no webhooks.
+
+    Returns the job in either terminal state. A failed job is returned, not
+    raised: it still carries every step that completed in output[] plus an
+    `error` object whose `step` names the failing step, and the caller decides
+    what to persist before retrying."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         job = get_job(job_id, api_key, include=include)
-        status = job.get("status")
-        if status == "completed":
+        if job.get("status") in ("completed", "failed"):
             return job
-        if status == "failed":
-            err = job.get("error") or {}
-            raise RuntimeError(f"Job {job_id} failed: "
-                               f"{err.get('code')} — {err.get('message')}")
         time.sleep(interval)
     raise TimeoutError(f"Job {job_id} did not finish within {timeout}s")
 
 
 def run_one(path, agent_id, api_key, *, config_id=None, include="all",
             metadata=None):
-    """Full flow for a single document. Returns the completed job dict."""
+    """Full flow for a single document. Returns the finished job dict
+    (status "completed" or "failed")."""
     file_id = upload_file(path, api_key)
     job_id, _ = create_job(agent_id, file_id, api_key,
                            config_id=config_id, include=include,
@@ -223,18 +242,24 @@ def _parse_json_maybe(value):
 
 
 def shape_job(job, document=None):
-    """Turn a completed job into the per-document JSON this script writes.
+    """Turn a finished job (completed OR failed) into the per-document JSON
+    this script writes.
 
     The API returns one item in `output[]` per step that ran, in execution
     order; the step's name is the item's `model` key and its type (document-parse,
     document-classify, information-extract, instruct, merge, validate) is the
-    item's `step_type` key. Each item carries a
-    `content[]` list with one entry per result — several when the step ran
-    once per split child. `text` is the step's output (a JSON string for
-    classify / extract / validate / merge; free text for instruct; the parsed
-    document JSON, with content.html inside, for parse) and `additional_values` is a JSON *string* holding per-step
-    extras (classify confidence and page ranges, validate check trace,
-    merge provenance). Both are parsed here when they parse.
+    item's `step_type` key, and each item has its own `status`. Each item
+    carries a `content[]` list with one entry per result — several when the
+    step ran once per split child. `text` is the step's output (a JSON string
+    for classify / extract / validate / merge; free text for instruct; the
+    parsed document JSON, with content.html inside, for parse) and
+    `additional_values` is a JSON *string* holding per-step extras (classify
+    confidence and page ranges, validate check trace, merge provenance). Both
+    are parsed here when they parse; a non-JSON `additional_values` string is
+    kept as-is rather than dropped.
+
+    A failed job still has every completed step in `output[]`; they are shaped
+    the same way, and the job's `error` is carried through.
 
     No assumptions are made about how many steps ran or what types they are.
     """
@@ -246,11 +271,11 @@ def shape_job(job, document=None):
         for part in item.get("content") or []:
             entry = dict(part)
             entry["text"] = _parse_json_maybe(part.get("text"))
-            av = _parse_json_maybe(part.get("additional_values"))
-            entry["additional_values"] = av if isinstance(av, (dict, list)) else None
+            entry["additional_values"] = _parse_json_maybe(part.get("additional_values"))
             contents.append(entry)
         steps.append({"index": i, "name": name, "type": item.get("step_type"),
-                      "step_id": item.get("step_id"), "content": contents})
+                      "step_id": item.get("step_id"), "status": item.get("status"),
+                      "content": contents})
         by_step.setdefault(name, []).extend(contents)   # list per name, never overwrite
 
     shaped = {
@@ -316,12 +341,18 @@ def main():
           + (f" @ {args.config_id}" if args.config_id else "")
           + f"  (include={args.include})\n")
 
-    results, failures = {}, {}
+    results, failures, partials = {}, {}, {}
 
     def work(path):
         job = run_one(path, args.agent, args.key,
                       config_id=args.config_id, include=args.include)
         return path, job
+
+    def write(name, shaped):
+        if args.output:
+            stem = os.path.splitext(name)[0]
+            with open(os.path.join(args.output, f"{stem}.json"), "w") as f:
+                json.dump(shaped, f, indent=2, ensure_ascii=False)
 
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
         futures = {ex.submit(work, path): path for path in inputs}
@@ -331,25 +362,37 @@ def main():
             try:
                 _, job = fut.result()
                 shaped = shape_job(job, document=name)
-                results[name] = shaped
-                cached = (job.get("metadata") or {}).get("cached")
-                tag = " (cached)" if cached == "true" else ""
                 names = ", ".join(st["name"] for st in shaped["steps"])
+                # The file is written in both terminal states: a failed job
+                # still carries every step that completed, and that is worth
+                # keeping before you retry.
+                write(name, shaped)
+                if shaped["status"] == "failed":
+                    err = shaped.get("error") or {}
+                    msg = (f"{err.get('code')} at step {err.get('step')!s} — "
+                           f"{err.get('message')} "
+                           f"({len(shaped['steps'])} completed step(s) kept: {names})")
+                    failures[name] = msg
+                    partials[name] = shaped
+                    print(f"  [fail] {name} — {msg}")
+                    continue
+                results[name] = shaped
+                hits = [(c.get("additional_values") or {}).get("cache_hit")
+                        if isinstance(c.get("additional_values"), dict) else None
+                        for st in shaped["steps"] for c in st["content"]]
+                tag = " (cached)" if hits and all(h is True for h in hits) else ""
                 print(f"  [ok] {name} — {len(shaped['steps'])} step(s){tag}: {names}")
-                if args.output:
-                    stem = os.path.splitext(name)[0]
-                    with open(os.path.join(args.output, f"{stem}.json"), "w") as f:
-                        json.dump(shaped, f, indent=2, ensure_ascii=False)
             except Exception as e:  # noqa: BLE001 — report, keep going
                 failures[name] = str(e)
                 print(f"  [fail] {name} — {e}")
 
     print(f"\nDone. {len(results)} succeeded, {len(failures)} failed.")
 
-    # For a single file with no --output, print the result to stdout.
-    if len(inputs) == 1 and not args.output and results:
-        print("\n" + json.dumps(next(iter(results.values())), indent=2,
-                                 ensure_ascii=False))
+    # For a single file with no --output, print the result to stdout
+    # (the partial result too, when the job failed).
+    if len(inputs) == 1 and not args.output and (results or partials):
+        print("\n" + json.dumps(next(iter((results or partials).values())),
+                                 indent=2, ensure_ascii=False))
 
     if failures:
         sys.exit(1)

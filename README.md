@@ -13,7 +13,7 @@ nothing to install.
 
 | You are… | Start with |
 |----------|-----------|
-| **An integrator** wiring a Studio Agent into your own application (any language, any platform) | [`INTEGRATION_QUICKSTART.md`](INTEGRATION_QUICKSTART.md) — the HTTP flow with curl: upload → create job with your correlation ID → poll (no webhooks) → read every step's output → retention, caching, errors, concurrency. Then `skill/upstage-studio/references/agent-api.md` for the full endpoint and per-step reference. |
+| **An integrator** wiring a Studio Agent into your own application (any language, any platform) | [`INTEGRATION_QUICKSTART.md`](INTEGRATION_QUICKSTART.md) — the HTTP flow with curl: upload → create job → poll (no webhooks) → read every step's output → retention, caching, errors, concurrency. Then `skill/upstage-studio/references/agent-api.md` for the full endpoint and per-step reference. |
 | **Evaluating an Agent on your documents** (a POC) | `skill/upstage-studio/SKILL.md` — run a folder, read the results, edit the schema, score accuracy. |
 | **Non-technical** — you want to run a folder of documents and look at the results | `gui/` — a local web GUI over the batch tool (`python3 gui/upstage_batch_gui.py`). |
 | **Using Claude Code or another coding agent** | Install `skill/upstage-studio` as a skill (below) and ask it to run, integrate, or iterate on your Agent. |

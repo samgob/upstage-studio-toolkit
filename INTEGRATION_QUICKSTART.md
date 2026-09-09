@@ -13,7 +13,8 @@ apply to your account.
 
 - An Agent built in Studio ([studio.upstage.ai](https://studio.upstage.ai)) — note
   its **Agent ID** (`agt_…`) and the **Config ID** (`cfg_…`) or version number of
-  the workflow version you tested.
+  the workflow version you tested. The Agent ID is in the agent's URL in Studio;
+  the config version (and its `cfg_…` ID) is in the agent's version list.
 - Outbound HTTPS to `https://api.upstage.ai`.
 - Documents in a supported format: jpg, png, bmp, tiff, heic, pdf, doc, docx,
   ppt, pptx, xls, xlsx, hwp, hwpx — up to 500 MB and 1,000 pages each.
@@ -54,7 +55,7 @@ must be fetchable by Upstage's servers — public or pre-signed, not on your
 private network) or `"file_data": "data:application/pdf;base64,…"` with a
 `"filename"`.
 
-## 4. Create the job — with your own correlation ID
+## 4. Create the job
 
 ```bash
 curl -s https://api.upstage.ai/v2/responses \
@@ -66,18 +67,20 @@ curl -s https://api.upstage.ai/v2/responses \
     "input": [ { "role": "user", "content": [ { "type": "input_file", "file_id": "file_XXX" } ] } ],
     "background": true,
     "include": ["all"],
-    "metadata": { "your_document_id": "INV-000123", "batch": "2026-09-09" }
+    "metadata": { "your_document_id": "INV-000123" }
   }'
 # → { "id": "job_XXX", "status": "in_progress", ... }
+#   ("metadata" is accepted here but not returned on reads — see below)
 ```
 
 - `config_id` pins the exact workflow version. Omit it and the Agent's current
   default runs — fine for a demo, not for production.
 - `include: ["all"]` returns every step's output; the default `["last"]` returns
   only the final step.
-- `metadata` is any JSON object of your own. It comes back unchanged on every
-  read of the job, so put your document ID / correlation ID there and you never
-  have to keep a job-ID → document map yourself.
+- `metadata` is accepted on job creation but, on the current API, is **not
+  returned** on reads — only server-set keys such as `source` come back. Keep
+  your own job-ID → document map; the reference scripts key results by
+  filename.
 
 ## 5. Poll until done — there are no webhooks
 
@@ -89,13 +92,22 @@ curl -s "https://api.upstage.ai/v2/responses/job_XXX?include[]=all" \
   -H "Authorization: Bearer $UPSTAGE_API_KEY"
 ```
 
-- Use the **bracketed** query form `include[]=all`. The unbracketed
-  `include=all` is silently ignored and you get only the last step.
+- Use the bracketed form `include[]=all`; it has worked consistently. The
+  unbracketed form has been observed to be ignored (you then get only the last
+  step). Send the brackets literally — a query builder that percent-encodes
+  `[]` (as some .NET helpers do) is untested; build the query string by hand.
 - `include[]` accepts only `all` or `last` on this endpoint; anything else
   (e.g. `output:extract`) is a **400**.
 - Every few seconds is a reasonable interval. The server itself abandons a job
   after 1 hour (`job_timeout_error`), so cap your loop there.
-- A `failed` job carries `error.code` and `error.message` (section 9).
+- A `failed` job carries `error.code`, `error.message` and `error.step`, and
+  still returns every step that completed (section 10).
+
+**How long to expect.** A multi-step job with an instruct step commonly runs
+one to several minutes — the instruct step dominates; `in_progress` for
+60–120 s is normal, not a hang. Model calls that time out surface as
+`timeout_error` with `error.step`; retry the job — steps that already completed
+are served from cache on the retry.
 
 ## 6. Read the output — keyed by step name
 
@@ -106,7 +118,7 @@ execution order.**
 {
   "id": "job_XXX",
   "status": "completed",
-  "metadata": { "source": "api", "cached": "false", "your_document_id": "INV-000123", "batch": "2026-09-09" },
+  "metadata": { "source": "api" },
   "output": [
     { "model": "parse",   "step_type": "document-parse",     "content": [ { "type": "output_text", "text": "{...}", "additional_values": "{...}" } ] },
     { "model": "classify","step_type": "document-classify",  "content": [ { "type": "output_text", "text": "invoice", "additional_values": "{...}" } ] },
@@ -125,10 +137,12 @@ Rules for a robust reader:
 2. Key results by name and **collect a list per name**. A step that ran on
    several branches (an extract after a classify that split the file) appears
    once per branch as separate items with the same name.
-3. `content[]` has one entry when the step ran once. Steps that run once per
-   split child — the splitting classify itself, and instruct / validate steps
-   after a merge — return **one entry per child** under a single item. Always
-   iterate `content[]`.
+3. `content[]` has one entry when the step ran once. After a splitting
+   classify, steps that run once per split child — the splitting classify
+   itself, and instruct / validate steps after a merge — return **one entry per
+   child** under a single item. After a `merge`, instruct and validate return
+   one `content[]` entry per split child and those entries are byte-identical
+   (the step saw the merged context). Always iterate `content[]`.
 4. `content[].text` is the step's output — a **JSON string** for classify,
    extract, validate and merge (parse it), free text for instruct, the parsed
    document JSON for parse.
@@ -174,9 +188,11 @@ curl -s -X DELETE https://api.upstage.ai/v2/files/file_XXX      -H "Authorizatio
 ## 9. Caching
 
 The same file (by content) run against the same config settings returns the
-prior result for **7 days**. `metadata.cached` is `"true"` when every step came
-from cache; each step's `additional_values.cache_hit` says whether that step
-did. For an integration this is usually welcome (a duplicate submission is
+prior result for **7 days**. `metadata.cached` may be absent on completed jobs
+(it was, even when steps were cache hits); treat a missing key as
+not-fully-cached and rely on each step's `additional_values.cache_hit`, which
+says whether that step came from cache. For an integration this is usually
+welcome (a duplicate submission is
 cheap and consistent). If you need a genuinely fresh run, change a step setting
 or the config version.
 
@@ -189,7 +205,16 @@ Job-level (`status: "failed"`, `error.code`):
 | `parse_error` / `preprocess_error` | The file could not be parsed / preprocessed | Check the file; try another format |
 | `classify_error` / `instruct_error` / `tool_execution_error` / `timeout_error` / `server_error` | Transient step failure (`error.step` names the step) | Retry the job |
 | `extract_error` | Extraction failed (often page count) | Reduce pages or simplify the schema; enhanced mode is capped at 50 pages |
+| `invalid_request_error` | The config is invalid at run time (`error.step` names the step) | Fix the config; don't retry |
 | `job_timeout_error` | Exceeded the 1-hour cap | Split the document |
+
+**A failed job still returns partial output.** `output[]` holds every step that
+completed before the failure; each item carries its own `status`
+(`completed` / `failed`) and `error.step` names the failing step. Observed:
+`{"code": "timeout_error", "step": "instruct", "message": "Request timed out.
+Please try again later."}` with 10 of 11 steps present. Persist what you got
+before retrying — on the retry, steps that already completed are served from
+cache.
 
 HTTP-level: `400` invalid request · `404` unknown ID · `409` file still
 converting (wait for `UPLOADED`) · `415` unsupported file type · `429` rate
@@ -215,7 +240,7 @@ your own documents.
 job and the parse step's `additional_values.source_file_boundaries` records
 which file each part came from. If you need one result per document — the
 usual case for a system of record — submit one job per file; it is simpler to
-correlate (one `metadata` object each) and to retry.
+correlate (one job ID per document in your own map) and to retry.
 
 ---
 

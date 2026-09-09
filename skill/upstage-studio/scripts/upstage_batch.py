@@ -167,7 +167,8 @@ DEFAULT_POLL = {
                           # Upstage's server-side job_timeout_error fires at 1 hour (3600s),
                           # so 2400s is safely under that while covering p99 on large reports.
                           # Jobs still processing when we give up can be recovered by re-running
-                          # with --resume — the job_id is retained server-side for 30 days.
+                          # with --resume — results stay retrievable by job_id per the Agent's
+                          # retention policy (`expires_after`); the job GET carries `expires_at`.
 }
 
 
@@ -583,10 +584,11 @@ def v2_upload_file(file_path: Path, api_key: str,
             file_id = result["id"]
             logger.debug(f"Uploaded {filename} -> {file_id}")
             # Wait until page-image conversion finishes before returning. Creating
-            # a job against a file that's still PROCESSING returns 409 (non-
-            # retryable here), so a large/slow-converting doc would otherwise fail
-            # its first pass and only recover on the auto-retry or --resume.
-            for _ in range(60):  # ~2 min ceiling at 2s intervals
+            # a job against a file that's still PROCESSING returns 409, so a
+            # large/slow-converting doc would otherwise fail its first pass and
+            # only recover on the auto-retry or --resume. (v2_create_job also
+            # retries one 409 after a short wait.)
+            for _ in range(150):  # ~5 min ceiling at 2s intervals
                 if is_shutdown_requested():
                     break
                 info = api_request(
@@ -626,7 +628,10 @@ def v2_create_job(file_id: str, agent_id: str, api_key: str,
                   config_id: Optional[str] = None,
                   include: List[str] = None,
                   logger: logging.Logger = None) -> Optional[str]:
-    """Create a V2 agent job and return the job_id."""
+    """Create a V2 agent job and return the job_id.
+
+    A 409 (file still converting) is retried once after a short wait; other
+    4xx errors are returned as failures."""
     payload = {
         "model": agent_id,
         "input": [{"role": "user", "content": [{"type": "input_file", "file_id": file_id}]}],
@@ -643,6 +648,15 @@ def v2_create_job(file_id: str, agent_id: str, api_key: str,
         data=data, timeout=60, logger=logger,
     )
 
+    if isinstance(result, dict) and result.get("status_code") == 409:
+        logger.info(f"File {file_id} still converting (409) — retrying job create in 15s")
+        time.sleep(15)
+        result = api_request(
+            "POST", f"{V2_BASE}/responses", api_key,
+            headers={"Content-Type": "application/json"},
+            data=data, timeout=60, logger=logger,
+        )
+
     if isinstance(result, dict) and result.get("id"):
         logger.debug(f"Created job {result['id']} for file {file_id}")
         return result["id"]
@@ -655,7 +669,11 @@ def v2_create_job(file_id: str, agent_id: str, api_key: str,
 def v2_poll_job(job_id: str, api_key: str, include: List[str] = None,
                 poll_config: Optional[Dict] = None,
                 logger: logging.Logger = None) -> Dict:
-    """Poll a V2 job until completed or failed. Returns the final response."""
+    """Poll a V2 job until completed or failed. Returns the final response.
+
+    A failed job comes back as {"success": False, ..., "raw": <the job>} —
+    `raw` still holds every step that completed in output[] and the API's
+    `error` object (with `step`), so the caller can keep the partial output."""
     pc = poll_config or DEFAULT_POLL
     interval = pc["interval"]
     max_wait = pc["max_wait"]
@@ -696,12 +714,18 @@ def v2_poll_job(job_id: str, api_key: str, include: List[str] = None,
             error_obj = result.get("error", {})
             error_code = "unknown_error"
             error_msg = str(error_obj)
+            error_step = None
             if isinstance(error_obj, dict):
                 error_code = error_obj.get("code", "unknown_error")
                 error_msg = error_obj.get("message", str(error_obj))
-            logger.error(f"ERROR [{error_code}] Job {job_id}: {error_msg}")
+                error_step = error_obj.get("step")
+            step_note = f" (step: {error_step})" if error_step else ""
+            n_done = len(result.get("output") or [])
+            logger.error(f"ERROR [{error_code}] Job {job_id}{step_note}: {error_msg}"
+                         f" — {n_done} step(s) returned before the failure")
             return {"success": False, "error": f"Job failed: {error_msg}",
-                    "error_code": error_code, "raw": result}
+                    "error_code": error_code, "error_step": error_step,
+                    "raw": result}
 
         logger.debug(f"Job {job_id}: {status} (elapsed {time.time() - start:.0f}s)")
         time.sleep(interval)
@@ -709,11 +733,12 @@ def v2_poll_job(job_id: str, api_key: str, include: List[str] = None,
     # Client-side poll deadline reached. The job is almost certainly still running
     # on Upstage's side (server-side job_timeout_error doesn't fire until 3600s).
     # Re-running with --resume will pick the job up by job_id and fetch final results
-    # without re-uploading or re-billing.
+    # without re-uploading or re-billing. Results stay retrievable by job_id per
+    # the Agent's retention policy (`expires_after`); the job GET carries `expires_at`.
     logger.warning(
         f"Client poll deadline ({max_wait}s) reached for job {job_id} — "
         f"job is likely still processing server-side. Re-run with --resume to "
-        f"collect final results (job results retained 30 days)."
+        f"collect final results (retrievable by job_id until the job's expires_at)."
     )
     return {"success": False,
             "error": f"Client poll timeout after {max_wait}s — job {job_id} "
@@ -723,12 +748,53 @@ def v2_poll_job(job_id: str, api_key: str, include: List[str] = None,
             "recoverable": True}
 
 
+def _shape_v2_output(output: List[Dict]):
+    """Shape a job's output[] generically: one entry per step in API order (the
+    step name is the output item's `model` key, and each item carries its own
+    `status`), and a LIST of content entries per step — a step that ran once
+    per split child has several. `text` is parsed when it holds JSON;
+    `additional_values` is a JSON string from the API (classify confidence /
+    page ranges, validate check trace, merge provenance) and is parsed too.
+    Works the same on a completed job and on the partial output of a failed one.
+    Returns (steps, extracted)."""
+    steps = []
+    extracted = {}
+    for i, step in enumerate(output or []):
+        step_name = step.get("model") or f"step_{i}"
+        entries = []
+        for content in step.get("content", []) or []:
+            entries.append({
+                "data": _parse_json_maybe(content.get("text", "")),
+                "additional_values": _parse_json_maybe(content.get("additional_values")),
+            })
+        steps.append({"index": i, "name": step_name, "type": step.get("step_type"),
+                      "step_id": step.get("step_id"), "status": step.get("status"),
+                      "content": entries})
+        extracted.setdefault(step_name, []).extend(entries)   # never overwrite
+    return steps, extracted
+
+
 def v2_process_one(file_path: Path, agent_id: str, api_key: str,
                    config_id: Optional[str] = None,
                    include: List[str] = None,
                    poll_config: Optional[Dict] = None,
                    logger: logging.Logger = None) -> Dict:
-    """Process a single document through a V2 Studio Agent: upload -> create job -> poll."""
+    """Process a single document through a V2 Studio Agent: upload -> create job -> poll.
+
+    Result keys (agent mode): `steps` (every step in API order, each with its
+    own `status` and a list of content entries), `extracted` (a list of
+    entries per step name), `final_output`, `metadata`, `usage`.
+
+    `final_output` is the last step's value. When that step ran once per split
+    child, the entries are collapsed to the single value if every entry is
+    equal (instruct / validate after a merge return identical per-child
+    entries, because the step saw the merged context); otherwise the list is
+    kept.
+
+    A job that FAILS still returns every step that completed, so `steps` and
+    `extracted` are populated from that partial output, `success` stays False,
+    and `error` / `error_code` / `error_step` record what failed — persist
+    what you got before retrying."""
     start_time = time.time()
     result = {
         "document": file_path.name,
@@ -765,6 +831,23 @@ def v2_process_one(file_path: Path, agent_id: str, api_key: str,
     if job_result.get("success") is False:
         result["error"] = job_result.get("error", "Polling failed")
         result["error_code"] = job_result.get("error_code", "unknown_error")
+        if job_result.get("error_step"):
+            result["error_step"] = job_result["error_step"]
+        # A failed job still returns every step that completed before the
+        # failure. Keep it — it is paid for, and a retry only needs to redo
+        # the step that failed.
+        raw = job_result.get("raw")
+        if isinstance(raw, dict):
+            result["status"] = raw.get("status")
+            result["metadata"] = raw.get("metadata")
+            result["usage"] = raw.get("usage", {})
+            if isinstance(raw.get("error"), dict):
+                result["api_error"] = raw["error"]
+            steps, extracted = _shape_v2_output(raw.get("output") or [])
+            if steps:
+                result["steps"] = steps
+                result["extracted"] = extracted
+                result["partial"] = True
         result["duration_seconds"] = round(time.time() - start_time, 2)
         return result
 
@@ -772,34 +855,19 @@ def v2_process_one(file_path: Path, agent_id: str, api_key: str,
     result["success"] = True
     result["status"] = job_result.get("status")
     result["usage"] = job_result.get("usage", {})
+    result["metadata"] = job_result.get("metadata")
 
-    # Shape the output generically: one entry per step in API order (the step
-    # name is the output item's `model` key), and a LIST of content entries per
-    # step — a step that ran once per split child has several. `text` is parsed
-    # when it holds JSON; `additional_values` is a JSON string from the API
-    # (classify confidence / page ranges, validate check trace, merge
-    # provenance) and is parsed too.
     output = job_result.get("output", []) or []
-    steps = []
-    extracted = {}
-    for i, step in enumerate(output):
-        step_name = step.get("model") or f"step_{i}"
-        entries = []
-        for content in step.get("content", []) or []:
-            entries.append({
-                "data": _parse_json_maybe(content.get("text", "")),
-                "additional_values": _parse_json_maybe(content.get("additional_values")),
-            })
-        steps.append({"index": i, "name": step_name, "type": step.get("step_type"),
-                      "step_id": step.get("step_id"), "content": entries})
-        extracted.setdefault(step_name, []).extend(entries)   # never overwrite
+    steps, extracted = _shape_v2_output(output)
     if output:
         result["steps"] = steps
         result["extracted"] = extracted
-        # Convenience "final_output" from the last step: the single value when
-        # the step produced one result, a list when it ran per split child.
+        # Convenience "final_output" from the last step. One value when the
+        # step produced one result. When it ran once per split child, collapse
+        # to the single value if every entry is equal (post-merge instruct /
+        # validate entries are identical); otherwise keep the list.
         last_values = [e["data"] for e in steps[-1]["content"]] if steps else []
-        if len(last_values) == 1:
+        if last_values and all(v == last_values[0] for v in last_values):
             result["final_output"] = last_values[0]
         elif last_values:
             result["final_output"] = last_values

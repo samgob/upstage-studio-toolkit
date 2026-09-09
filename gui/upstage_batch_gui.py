@@ -12,7 +12,9 @@ Features:
   - Click-to-expand JSON viewer for each document's extraction output
   - Resume, dry-run, and all batch options
 
-Requirements: Python 3.8+, upstage_batch.py in the parent directory.
+Requirements: Python 3.8+, upstage_batch.py next to this file (as shipped in
+the GUI zip) or, in a clone of the toolkit repo, at
+skill/upstage-studio/scripts/upstage_batch.py.
 Works on macOS, Windows, and Linux. Zero third-party dependencies.
 
 Usage:
@@ -22,7 +24,7 @@ Usage:
 Author: Upstage AI — Solutions Engineering
 """
 
-__version__ = "2.0.0"
+__version__ = "2.6.0"
 
 import http.server
 import json
@@ -48,11 +50,17 @@ DEFAULT_PORT = 8484
 # the Host header on every request (DNS-rebinding defense — see _host_ok).
 SERVER_PORT = DEFAULT_PORT
 
-# Find batch script — check same dir, then parent dir
-SCRIPT_DIR = Path(__file__).parent
-BATCH_SCRIPT = SCRIPT_DIR / "upstage_batch.py"
-if not BATCH_SCRIPT.exists():
-    BATCH_SCRIPT = SCRIPT_DIR.parent / "upstage_batch.py"
+# Find the batch script. In the GUI zip it sits next to this file; in a fresh
+# clone of the toolkit repo neither gui/ nor its parent has it, and the single
+# committed copy lives in the skill folder — resolve that relative to this
+# file's own location, not the working directory.
+SCRIPT_DIR = Path(__file__).resolve().parent
+_BATCH_CANDIDATES = [
+    SCRIPT_DIR / "upstage_batch.py",
+    SCRIPT_DIR.parent / "upstage_batch.py",
+    SCRIPT_DIR.parent / "skill" / "upstage-studio" / "scripts" / "upstage_batch.py",
+]
+BATCH_SCRIPT = next((p for p in _BATCH_CANDIDATES if p.exists()), _BATCH_CANDIDATES[0])
 
 # Global state
 _state = {
@@ -1178,7 +1186,7 @@ def start_batch(config):
         return {"error": "Schema file required for V1 Extract/Classify"}
 
     if not BATCH_SCRIPT.exists():
-        return {"error": f"Batch script not found at: {BATCH_SCRIPT}\nPlace upstage_batch.py in the same or parent directory."}
+        return {"error": f"Batch script not found at: {BATCH_SCRIPT}\nPlace upstage_batch.py next to this file, or run from a clone of the toolkit repo (skill/upstage-studio/scripts/upstage_batch.py)."}
 
     # Build command
     cmd = [sys.executable, str(BATCH_SCRIPT), mode]

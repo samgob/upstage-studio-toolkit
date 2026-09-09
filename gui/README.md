@@ -39,5 +39,11 @@ CLI output, optional `pikepdf` for auto-repairing corrupted PDF headers).
   documents (or a folder you choose). Interrupted runs resume with `--resume`.
 - Each document's result JSON carries every step the Agent ran (`steps`, in
   order) and a per-step-name list (`extracted`), so split children and
-  validate / merge steps are all there. `upstage_batch.py` here is a copy of
-  `skill/upstage-studio/scripts/upstage_batch.py` in the toolkit repo.
+  validate / merge steps are all there.
+- `upstage_batch.py` ships inside the GUI zip next to `upstage_batch_gui.py`.
+  In a clone of the toolkit repo it is not in `gui/` — the GUI resolves it from
+  `skill/upstage-studio/scripts/upstage_batch.py` instead, so a plain clone
+  runs without a build step.
+- A document whose job fails still gets a result JSON: every step that
+  completed before the failure is there under `steps` / `extracted`, with the
+  error code and the failing step recorded, so nothing already paid for is lost.
